@@ -1,0 +1,45 @@
+{
+  "patient_info": {
+    "patient_id": "1",
+    "name": "1",
+    "age": "11",
+    "gender": "Male",
+    "phone": "1",
+    "medical_history": "11",
+    "examination_date": "2025-08-06T17:56:57.223862"
+  },
+  "doctor_info": {
+    "doctor_id": "2",
+    "name": "2",
+    "specialization": "Ophthalmologist",
+    "hospital": "22"
+  },
+  "detection_result": {
+    "has_glaucoma": true,
+    "confidence": 0.8717302680015564,
+    "detected_features": [
+      {
+        "class": "healthy",
+        "confidence": 0.8717302680015564,
+        "bbox": [
+          347,
+          645,
+          566,
+          881
+        ]
+      },
+      {
+        "class": "glaucoma",
+        "confidence": 0.7052690982818604,
+        "bbox": [
+          414,
+          705,
+          533,
+          818
+        ]
+      }
+    ],
+    "analysis_timestamp": "2025-08-06T17:56:57.223892"
+  },
+  "image_path": "results\\glaucoma_result_20250806_175654.jpg"
+}

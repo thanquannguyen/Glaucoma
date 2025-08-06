@@ -1,0 +1,54 @@
+# Glaucoma Detection System Requirements
+# YOLOv11-based glaucoma detection with GPU acceleration
+
+# Core ML and Computer Vision (GPU-enabled versions)
+# For CUDA support, install using:
+# pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+torch>=2.0.0+cu118  # CUDA-enabled PyTorch
+torchvision>=0.15.0+cu118  # CUDA-enabled torchvision
+opencv-python>=4.5.0
+numpy>=1.24.0
+ultralytics>=8.0.0  # YOLOv11 support
+
+# GUI Framework
+# tkinter is built-in with Python, no need to install via pip
+Pillow>=8.3.0
+
+# HTTP and API Communication
+requests>=2.25.0
+
+# Data Handling
+# json is built-in Python module, no need to install via pip
+
+# YOLOv11 and analysis dependencies
+matplotlib>=3.2.2
+PyYAML>=5.3.1
+scipy>=1.4.1
+tqdm>=4.41.0
+tensorboard>=2.4.1
+pandas>=1.1.4
+seaborn>=0.11.0
+psutil>=5.8.0  # System monitoring
+py-cpuinfo>=8.0.0  # CPU information
+
+# GPU Support Installation Guide
+# =================================
+# For NVIDIA GPU users:
+# 1. First install regular requirements: pip install -r requirements_glaucoma.txt
+# 2. Then replace PyTorch with CUDA version:
+#    pip uninstall torch torchvision -y
+#    pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+# 
+# For CPU-only systems:
+# 1. Install with CPU-only PyTorch: pip install torch torchvision
+# 
+# Verify GPU support: python -c "import torch; print('CUDA:', torch.cuda.is_available())"
+
+# Development and testing (optional)
+pytest>=6.0.0
+black>=21.0.0
+flake8>=3.8.0
+
+# Medical imaging specific (if needed)
+# pydicom>=2.0.0  # For DICOM medical image format
+# SimpleITK>=2.0.0  # For medical image processing 
