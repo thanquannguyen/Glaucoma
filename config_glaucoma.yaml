@@ -1,0 +1,203 @@
+# Glaucoma Detection System Configuration
+
+# Model Configuration
+model:
+  # Path to the trained glaucoma detection model
+  model_path: "runs/glaucoma_train/yolov7_tiny_glaucoma/weights/best.pt"
+  
+  # Alternative model paths for different scenarios
+  backup_models:
+    - "yolov7-tiny.pt"  # Pre-trained weights
+    - "runs/glaucoma_train/yolov7_tiny_glaucoma/weights/last.pt"  # Last checkpoint
+  
+  # Model inference settings
+  confidence_threshold: 0.35
+  iou_threshold: 0.65
+  image_size: 416  # Optimized for Jetson Nano
+  device: "auto"  # auto, cpu, cuda:0, etc.
+  
+  # Class names for glaucoma detection (simplified for binary classification)
+  class_names:
+    - "healthy"
+    - "glaucoma"
+    
+# Camera Configuration (optimized for Jetson Nano)
+camera:
+  default_camera_id: 0
+  max_cameras_to_scan: 2  # Reduced for Jetson Nano
+  frame_width: 416        # Matches model input size
+  frame_height: 416       # Square format for consistency
+  fps: 15                 # Reduced FPS for Jetson Nano
+  
+  # Camera settings
+  auto_focus: true
+  brightness: 50
+  contrast: 50
+  saturation: 50
+
+# UI Configuration
+ui:
+  window_title: "Glaucoma Detection System"
+  window_size: "1200x900"
+  resizable: false
+  
+  # Display settings
+  camera_display_size: [500, 375]
+  font_family: "Helvetica"
+  font_sizes:
+    title: 24
+    section: 12
+    normal: 10
+  
+  # Colors
+  colors:
+    background: "#f0f0f0"
+    error: "#ff0000"
+    success: "#00ff00"
+    warning: "#ffaa00"
+    info: "#0066cc"
+
+# Data Storage
+storage:
+  # Directories
+  results_dir: "results"
+  images_dir: "results/images"
+  reports_dir: "results/reports"
+  logs_dir: "logs"
+  
+  # File naming
+  image_prefix: "glaucoma_result"
+  report_prefix: "glaucoma_report"
+  timestamp_format: "%Y%m%d_%H%M%S"
+  
+  # Auto-cleanup settings
+  max_files_per_directory: 1000
+  auto_cleanup_days: 30
+
+# Server Communication
+server:
+  # Server endpoints
+  base_url: "https://your-medical-server.com/api"
+  endpoints:
+    upload_results: "/glaucoma-results"
+    patient_lookup: "/patients"
+    doctor_lookup: "/doctors"
+  
+  # Authentication
+  api_key: "YOUR_API_KEY_HERE"
+  timeout: 30  # seconds
+  retry_attempts: 3
+  
+  # Enable/disable server communication
+  enabled: false
+
+# Medical Settings
+medical:
+  # Required patient fields
+  required_patient_fields:
+    - "patient_id"
+    - "name"
+    - "age"
+    - "gender"
+  
+  # Required doctor fields
+  required_doctor_fields:
+    - "doctor_id"
+    - "name"
+    - "specialization"
+  
+  # Validation rules
+  validation:
+    patient_id_pattern: "^P[0-9]{3,}$"  # P followed by 3+ digits
+    doctor_id_pattern: "^D[0-9]{3,}$"   # D followed by 3+ digits
+    age_min: 0
+    age_max: 120
+    phone_pattern: "^[+]?[0-9]{10,15}$"
+  
+  # Specializations
+  doctor_specializations:
+    - "Ophthalmologist"
+    - "General Practitioner"
+    - "Specialist"
+    - "Resident"
+    - "Fellow"
+
+# Detection Settings
+detection:
+  # Live detection
+  live_detection_fps: 10
+  live_detection_confidence: 0.5
+  
+  # Analysis detection (more thorough)
+  analysis_confidence: 0.3
+  analysis_iou: 0.1
+  
+  # Glaucoma determination rules
+  glaucoma_indicators:
+    - "glaucomatous_optic_disc"
+    - "cup_to_disc_ratio_abnormal"
+  
+  # Confidence thresholds for diagnosis
+  diagnosis_thresholds:
+    high_confidence: 0.8
+    medium_confidence: 0.6
+    low_confidence: 0.4
+
+# Logging Configuration
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+  console_logging: true
+  file_logging: true
+  log_file: "logs/glaucoma_system.log"
+  max_log_size: "10MB"
+  backup_count: 5
+  
+  # Log formatting
+  format: "[%(asctime)s] %(levelname)s - %(message)s"
+  date_format: "%Y-%m-%d %H:%M:%S"
+
+# Performance Settings
+performance:
+  # Memory management
+  max_cached_frames: 10
+  clear_cache_interval: 100  # frames
+  
+  # Threading
+  max_worker_threads: 4
+  
+  # GPU memory management
+  gpu_memory_fraction: 0.8
+  allow_growth: true
+
+# Security Settings
+security:
+  # Data encryption (for future implementation)
+  encrypt_patient_data: false
+  encryption_key_file: "keys/encryption.key"
+  
+  # Access control
+  require_authentication: false
+  session_timeout: 3600  # seconds
+  
+  # Data retention
+  patient_data_retention_days: 2555  # 7 years
+  log_retention_days: 365
+
+# Development Settings (for debugging)
+development:
+  debug_mode: false
+  verbose_logging: false
+  save_debug_images: false
+  mock_server_responses: false
+  
+  # Testing
+  test_patient_data:
+    patient_id: "P001"
+    name: "Test Patient"
+    age: "45"
+    gender: "Male"
+  
+  test_doctor_data:
+    doctor_id: "D001"
+    name: "Dr. Test"
+    specialization: "Ophthalmologist" 

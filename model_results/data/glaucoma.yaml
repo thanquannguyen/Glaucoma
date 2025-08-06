@@ -1,0 +1,7 @@
+names:
+- healthy
+- glaucoma
+nc: 2
+test: /kaggle/input/glaucoma-odcd-segmentation-for-yolo/dataset/test/images
+train: /kaggle/input/glaucoma-odcd-segmentation-for-yolo/dataset/train/images
+val: /kaggle/input/glaucoma-odcd-segmentation-for-yolo/dataset/val/images

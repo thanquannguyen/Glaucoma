@@ -1,0 +1,24 @@
+{
+  "patient_info": {
+    "patient_id": "1",
+    "name": "1",
+    "age": "11",
+    "gender": "Male",
+    "phone": "1",
+    "medical_history": "11",
+    "examination_date": "2025-08-06T17:57:18.052991"
+  },
+  "doctor_info": {
+    "doctor_id": "2",
+    "name": "2",
+    "specialization": "Ophthalmologist",
+    "hospital": "22"
+  },
+  "detection_result": {
+    "has_glaucoma": false,
+    "confidence": 0.0,
+    "detected_features": [],
+    "analysis_timestamp": "2025-08-06T17:57:18.053022"
+  },
+  "image_path": "results\\glaucoma_result_20250806_175716.jpg"
+}
