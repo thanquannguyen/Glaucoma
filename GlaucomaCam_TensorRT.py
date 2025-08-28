@@ -215,15 +215,13 @@ class GlaucomaApplication(tk.Tk):
         """Post-process TensorRT outputs to get bounding boxes"""
         detections = []
         
-        # Debug: Print output shape to understand the format
-        self.log_to_console(f"TensorRT output shape: {outputs.shape}, size: {outputs.size}")
-        
-        # Additional debug: print some sample values
-        if outputs.size > 0:
-            flat_outputs = outputs.flatten()
-            sample_size = min(20, len(flat_outputs))
-            self.log_to_console(f"First {sample_size} output values: {flat_outputs[:sample_size]}")
-            self.log_to_console(f"Output min: {flat_outputs.min():.6f}, max: {flat_outputs.max():.6f}")
+        # Debug: Print output shape to understand the format (only first time)
+        if not hasattr(self, '_output_shape_logged'):
+            self.log_to_console(f"TensorRT output shape: {outputs.shape}, size: {outputs.size}")
+            if outputs.size > 0:
+                flat_outputs = outputs.flatten()
+                self.log_to_console(f"Output value range: {flat_outputs.min():.6f} to {flat_outputs.max():.6f}")
+            self._output_shape_logged = True
         
         # Handle different output formats
         if len(outputs.shape) == 1:
@@ -295,21 +293,33 @@ class GlaucomaApplication(tk.Tk):
                         final_conf = confidence
                     
                     if final_conf > self.conf_threshold:
-                        # Scale bounding box coordinates
-                        # YOLO outputs are typically normalized (0-1) or in input image coordinates
+                        # Check if coordinates are normalized (0-1) or in pixel coordinates
+                        is_normalized = x_center <= 1.0 and y_center <= 1.0 and width <= 1.0 and height <= 1.0
                         
-                        # If coordinates are normalized (0-1), scale to input size
-                        if x_center <= 1.0 and y_center <= 1.0:
+                        if is_normalized:
+                            # Normalized coordinates (0-1) - scale to input image size
                             x_center *= self.input_size[0]
                             y_center *= self.input_size[1]
                             width *= self.input_size[0]
                             height *= self.input_size[1]
                         
-                        # Convert from center format to corner format
-                        x1 = int((x_center - width / 2 - dx) / scale)
-                        y1 = int((y_center - height / 2 - dy) / scale)
-                        x2 = int((x_center + width / 2 - dx) / scale)
-                        y2 = int((y_center + height / 2 - dy) / scale)
+                        # Convert from center format to corner format in input space
+                        x1_input = x_center - width / 2
+                        y1_input = y_center - height / 2
+                        x2_input = x_center + width / 2
+                        y2_input = y_center + height / 2
+                        
+                        # Remove padding offset (convert from padded input to resized image space)
+                        x1_resized = x1_input - dx
+                        y1_resized = y1_input - dy
+                        x2_resized = x2_input - dx
+                        y2_resized = y2_input - dy
+                        
+                        # Scale back to original image size
+                        x1 = int(x1_resized / scale)
+                        y1 = int(y1_resized / scale)
+                        x2 = int(x2_resized / scale)
+                        y2 = int(y2_resized / scale)
                         
                         # Clip to image bounds
                         x1 = max(0, min(x1, orig_shape[1]))
@@ -328,6 +338,15 @@ class GlaucomaApplication(tk.Tk):
         
         # Apply NMS
         self.log_to_console(f"Found {len(detections)} detections before NMS")
+        
+        # Debug: Show first few detections for troubleshooting
+        if len(detections) > 0 and not hasattr(self, '_detection_debug_shown'):
+            self.log_to_console("Sample detections (before NMS):")
+            for i, det in enumerate(detections[:3]):  # Show first 3
+                bbox = det['bbox']
+                self.log_to_console(f"  Detection {i}: class={det['class_name']}, conf={det['confidence']:.3f}, bbox=({bbox[0]}, {bbox[1]}, {bbox[2]}, {bbox[3]})")
+            self._detection_debug_shown = True
+        
         detections = self.apply_nms(detections)
         self.log_to_console(f"Found {len(detections)} detections after NMS")
         
