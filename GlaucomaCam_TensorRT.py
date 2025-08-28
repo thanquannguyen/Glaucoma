@@ -334,15 +334,14 @@ class GlaucomaApplication(tk.Tk):
                         # Calculate resized dimensions (like lines 33-41 in processing.py)
                         if (orig_w / self.input_size[0]) >= (orig_h / self.input_size[1]):
                             old_h = int(self.input_size[1] * orig_w / self.input_size[0])
+                            old_w = orig_w
                             offset_h = (old_h - orig_h) // 2
                             offset_w = 0
                         else:
                             old_w = int(self.input_size[0] * orig_h / self.input_size[1])
+                            old_h = orig_h
                             offset_w = (old_w - orig_w) // 2
                             offset_h = 0
-                            old_h = orig_h
-                            if 'old_w' not in locals():
-                                old_w = orig_w
                         
                         # Scale to original size (like line 43 in processing.py)
                         x1_scaled = x1_norm * old_w
