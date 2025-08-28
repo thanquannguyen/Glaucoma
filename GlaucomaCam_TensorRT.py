@@ -193,7 +193,7 @@ class GlaucomaApplication(tk.Tk):
         # Create padded image
         padded = np.full((self.input_size[1], self.input_size[0], 3), 114, dtype=np.uint8)
         
-        # Calculate padding offsets
+        # Calculate padding offsets to center the image
         dx = (self.input_size[0] - new_w) // 2
         dy = (self.input_size[1] - new_h) // 2
         
@@ -208,6 +208,12 @@ class GlaucomaApplication(tk.Tk):
         
         # Add batch dimension
         padded = np.expand_dims(padded, axis=0)
+        
+        # Log preprocessing details for debugging
+        if not hasattr(self, '_preprocess_logged'):
+            self.log_to_console(f"Preprocessing: {w}x{h} → {new_w}x{new_h} → {self.input_size[0]}x{self.input_size[1]}")
+            self.log_to_console(f"Scale: {scale:.3f}, Padding: dx={dx}, dy={dy}")
+            self._preprocess_logged = True
         
         return padded, scale, dx, dy
 
@@ -293,33 +299,60 @@ class GlaucomaApplication(tk.Tk):
                         final_conf = confidence
                     
                     if final_conf > self.conf_threshold:
-                        # Check if coordinates are normalized (0-1) or in pixel coordinates
-                        is_normalized = x_center <= 1.0 and y_center <= 1.0 and width <= 1.0 and height <= 1.0
+                        # Debug: Log transformation details for first few detections
+                        debug_this = len(detections) < 3 and not hasattr(self, '_coord_debug_shown')
                         
-                        if is_normalized:
-                            # Normalized coordinates (0-1) - scale to input image size
-                            x_center *= self.input_size[0]
-                            y_center *= self.input_size[1]
-                            width *= self.input_size[0]
-                            height *= self.input_size[1]
+                        if debug_this:
+                            self.log_to_console(f"=== Coordinate Debug {len(detections)} ===")
+                            self.log_to_console(f"Raw: center=({x_center:.3f}, {y_center:.3f}), size=({width:.3f}x{height:.3f})")
+                            self.log_to_console(f"Transform params: scale={scale:.3f}, dx={dx}, dy={dy}")
+                            self.log_to_console(f"Input size: {self.input_size}, Original shape: {orig_shape}")
                         
-                        # Convert from center format to corner format in input space
-                        x1_input = x_center - width / 2
-                        y1_input = y_center - height / 2
-                        x2_input = x_center + width / 2
-                        y2_input = y_center + height / 2
+                        # Try multiple coordinate transformation approaches
+                        # Approach 1: Standard YOLO format (assume coordinates are in input image space)
                         
-                        # Remove padding offset (convert from padded input to resized image space)
-                        x1_resized = x1_input - dx
-                        y1_resized = y1_input - dy
-                        x2_resized = x2_input - dx
-                        y2_resized = y2_input - dy
+                        # Check if coordinates look normalized (0-1 range)
+                        max_coord = max(x_center, y_center, width, height)
+                        is_likely_normalized = max_coord <= 1.0
                         
-                        # Scale back to original image size
-                        x1 = int(x1_resized / scale)
-                        y1 = int(y1_resized / scale)
-                        x2 = int(x2_resized / scale)
-                        y2 = int(y2_resized / scale)
+                        if debug_this:
+                            self.log_to_console(f"Max coordinate: {max_coord:.3f}, likely normalized: {is_likely_normalized}")
+                        
+                        # Method 1: Treat as normalized coordinates
+                        if is_likely_normalized:
+                            # Direct scaling to original image size (skip input size)
+                            orig_h, orig_w = orig_shape[:2]
+                            x1_v1 = int((x_center - width/2) * orig_w)
+                            y1_v1 = int((y_center - height/2) * orig_h)
+                            x2_v1 = int((x_center + width/2) * orig_w)
+                            y2_v1 = int((y_center + height/2) * orig_h)
+                        else:
+                            # Method 2: Treat as input space coordinates with padding removal
+                            x1_input = x_center - width / 2
+                            y1_input = y_center - height / 2
+                            x2_input = x_center + width / 2
+                            y2_input = y_center + height / 2
+                            
+                            # Remove padding
+                            x1_resized = x1_input - dx
+                            y1_resized = y1_input - dy
+                            x2_resized = x2_input - dx
+                            y2_resized = y2_input - dy
+                            
+                            # Scale to original
+                            x1_v1 = int(x1_resized / scale)
+                            y1_v1 = int(y1_resized / scale)
+                            x2_v1 = int(x2_resized / scale)
+                            y2_v1 = int(y2_resized / scale)
+                        
+                        # Use the calculated coordinates
+                        x1, y1, x2, y2 = x1_v1, y1_v1, x2_v1, y2_v1
+                        
+                        if debug_this:
+                            self.log_to_console(f"Method used: {'Normalized direct' if is_likely_normalized else 'Input space with padding'}")
+                            self.log_to_console(f"Final coordinates: ({x1}, {y1}) to ({x2}, {y2})")
+                            if len(detections) >= 2:
+                                self._coord_debug_shown = True
                         
                         # Clip to image bounds
                         x1 = max(0, min(x1, orig_shape[1]))
