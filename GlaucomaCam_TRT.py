@@ -331,13 +331,28 @@ class TRTDetector:
 
             # Map back to original image
             boxes_mapped = []
+            # Heuristic: if coordinates clearly exceed letterbox size, treat as already in original space
+            treat_as_orig = boxes_xyxy.size and (np.max(boxes_xyxy) > max(W_in, H_in) * 1.5)
             for (x1, y1, x2, y2) in boxes_xyxy:
-                x1, y1, x2, y2 = self._choose_best_mapping([x1, y1, x2, y2], pad_x, pad_y, sx, sy, W0, H0)
+                if treat_as_orig:
+                    x1 = float(np.clip(x1, 0, W0 - 1))
+                    y1 = float(np.clip(y1, 0, H0 - 1))
+                    x2 = float(np.clip(x2, 0, W0 - 1))
+                    y2 = float(np.clip(y2, 0, H0 - 1))
+                else:
+                    x1, y1, x2, y2 = self._choose_best_mapping([x1, y1, x2, y2], pad_x, pad_y, sx, sy, W0, H0)
                 boxes_mapped.append([x1, y1, x2, y2])
 
             # NMS
             keep = self._nms(boxes_mapped, scores.tolist(), self.iou_threshold)
-            dets = [[*boxes_mapped[i], float(scores[i]), int(cls_ids[i]) + self.class_offset] for i in keep]
+            dets = []
+            for i in keep:
+                x1, y1, x2, y2 = boxes_mapped[i]
+                # skip degenerate tiny boxes
+                if (x2 - x1) < 2 or (y2 - y1) < 2:
+                    continue
+                cls_final = max(0, int(cls_ids[i]) + self.class_offset)
+                dets.append([x1, y1, x2, y2, float(scores[i]), cls_final])
             return dets
 
         # Unknown format
