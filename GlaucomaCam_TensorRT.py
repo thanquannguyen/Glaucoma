@@ -67,15 +67,20 @@ class TensorRTInference:
             
             # Append to the appropriate list
             if self.engine.binding_is_input(binding):
-                self.inputs.append({'host': host_mem, 'device': device_mem, 'shape': shape})
+                self.inputs.append({'name': binding, 'host': host_mem, 'device': device_mem, 'shape': shape})
             else:
-                self.outputs.append({'host': host_mem, 'device': device_mem, 'shape': shape})
+                self.outputs.append({'name': binding, 'host': host_mem, 'device': device_mem, 'shape': shape})
         
         # Create stream
         self.stream = cuda.Stream()
         
     def infer(self, input_data):
         """Run inference with TensorRT"""
+        # If dynamic engine, set shapes once
+        if hasattr(self, 'inputs') and len(self.inputs) > 0 and 'shape' in self.inputs[0]:
+            if -1 in self.inputs[0]['shape']:
+                self.context.set_binding_shape(self.engine.get_binding_index(self.engine[0]), self.input_shape)
+        
         # Copy input data to host buffer
         np.copyto(self.inputs[0]['host'], input_data.ravel())
         
@@ -85,21 +90,23 @@ class TensorRTInference:
         # Run inference
         self.context.execute_async_v2(bindings=self.bindings, stream_handle=self.stream.handle)
         
-        # Transfer predictions back from GPU
-        cuda.memcpy_dtoh_async(self.outputs[0]['host'], self.outputs[0]['device'], self.stream)
-        
-        # Synchronize stream
+        # COPY BACK **ALL** OUTPUTS
+        for out in self.outputs:
+            cuda.memcpy_dtoh_async(out['host'], out['device'], self.stream)
         self.stream.synchronize()
         
-        # Return output with proper shape
-        output_data = self.outputs[0]['host']
-        output_shape = self.outputs[0]['shape']
+        # Pack into a dict keyed by binding name
+        out_dict = {}
+        for i, binding in enumerate(self.engine):
+            if not self.engine.binding_is_input(binding):
+                o = self.outputs[len(out_dict)]
+                arr = o['host']
+                shape = tuple(int(s) for s in o['shape'])
+                if all(s > 0 for s in shape):
+                    arr = arr.reshape(shape)
+                out_dict[binding] = arr
         
-        # Reshape to proper dimensions if we have shape info
-        if output_shape and len(output_shape) > 1:
-            output_data = output_data.reshape(output_shape)
-        
-        return output_data
+        return out_dict
 
 
 class GlaucomaApplication(tk.Tk):
@@ -221,13 +228,67 @@ class GlaucomaApplication(tk.Tk):
         """Post-process TensorRT outputs to get bounding boxes"""
         detections = []
         
-        # Debug: Print output shape to understand the format (only first time)
+        # Debug: Print output info (only first time)
         if not hasattr(self, '_output_shape_logged'):
-            self.log_to_console(f"TensorRT output shape: {outputs.shape}, size: {outputs.size}")
-            if outputs.size > 0:
-                flat_outputs = outputs.flatten()
-                self.log_to_console(f"Output value range: {flat_outputs.min():.6f} to {flat_outputs.max():.6f}")
+            if isinstance(outputs, dict):
+                self.log_to_console(f"TensorRT outputs (EfficientNMS): {list(outputs.keys())}")
+                for name, arr in outputs.items():
+                    self.log_to_console(f"  {name}: shape={arr.shape}, dtype={arr.dtype}")
+            else:
+                self.log_to_console(f"TensorRT output shape: {outputs.shape}, size: {outputs.size}")
             self._output_shape_logged = True
+        
+        # Handle EfficientNMS (4 outputs: num_dets, boxes, scores, classes)
+        if isinstance(outputs, dict):
+            # Try common names first
+            keys = outputs.keys()
+            def pick(name_opts, fallback=None):
+                for k in name_opts:
+                    if k in keys:
+                        return outputs[k]
+                return fallback
+
+            num   = pick(["num_dets", "nmsed_num", "num_detections"])
+            boxes = pick(["det_boxes", "boxes", "nmsed_boxes"])
+            scores= pick(["det_scores","scores","nmsed_scores"])
+            clses = pick(["det_classes","classes","nmsed_classes"])
+
+            # If we found the NMS quartet, use it
+            if boxes is not None and scores is not None and clses is not None:
+                n = int(num[0]) if num is not None else boxes.shape[1]
+                self.log_to_console(f"EfficientNMS: {n} detections from NMS")
+                
+                boxes = boxes[0, :n]        # (n, 4) xyxy on input scale (e.g., 416x416)
+                scores = scores[0, :n]
+                clses = clses[0, :n].astype(int)
+
+                oh, ow = orig_shape[:2]
+                for (x1, y1, x2, y2), conf, cid in zip(boxes, scores, clses):
+                    if conf < self.conf_threshold:
+                        continue
+                    
+                    # Undo letterbox: subtract padding, then divide by scale
+                    x1 = int((x1 - dx) / scale)
+                    y1 = int((y1 - dy) / scale)
+                    x2 = int((x2 - dx) / scale)
+                    y2 = int((y2 - dy) / scale)
+
+                    # Clip to image bounds
+                    x1 = max(0, min(x1, ow))
+                    y1 = max(0, min(y1, oh))
+                    x2 = max(0, min(x2, ow))
+                    y2 = max(0, min(y2, oh))
+                    
+                    if x2 > x1 and y2 > y1:
+                        detections.append({
+                            "bbox": [x1, y1, x2, y2],
+                            "confidence": float(conf),
+                            "class_id": int(cid),
+                            "class_name": self.class_names.get(int(cid), f"class_{int(cid)}")
+                        })
+                
+                self.log_to_console(f"Found {len(detections)} valid detections after processing")
+                return detections  # Skip the old processing and NMS since it's already done
         
         # Handle different output formats
         if len(outputs.shape) == 1:
