@@ -67,20 +67,15 @@ class TensorRTInference:
             
             # Append to the appropriate list
             if self.engine.binding_is_input(binding):
-                self.inputs.append({'name': binding, 'host': host_mem, 'device': device_mem, 'shape': shape})
+                self.inputs.append({'host': host_mem, 'device': device_mem, 'shape': shape})
             else:
-                self.outputs.append({'name': binding, 'host': host_mem, 'device': device_mem, 'shape': shape})
+                self.outputs.append({'host': host_mem, 'device': device_mem, 'shape': shape})
         
         # Create stream
         self.stream = cuda.Stream()
         
     def infer(self, input_data):
         """Run inference with TensorRT"""
-        # If dynamic engine, set shapes once
-        if hasattr(self, 'inputs') and len(self.inputs) > 0 and 'shape' in self.inputs[0]:
-            if -1 in self.inputs[0]['shape']:
-                self.context.set_binding_shape(self.engine.get_binding_index(self.engine[0]), self.input_shape)
-        
         # Copy input data to host buffer
         np.copyto(self.inputs[0]['host'], input_data.ravel())
         
@@ -90,23 +85,21 @@ class TensorRTInference:
         # Run inference
         self.context.execute_async_v2(bindings=self.bindings, stream_handle=self.stream.handle)
         
-        # COPY BACK **ALL** OUTPUTS
-        for out in self.outputs:
-            cuda.memcpy_dtoh_async(out['host'], out['device'], self.stream)
+        # Transfer predictions back from GPU
+        cuda.memcpy_dtoh_async(self.outputs[0]['host'], self.outputs[0]['device'], self.stream)
+        
+        # Synchronize stream
         self.stream.synchronize()
         
-        # Pack into a dict keyed by binding name
-        out_dict = {}
-        for i, binding in enumerate(self.engine):
-            if not self.engine.binding_is_input(binding):
-                o = self.outputs[len(out_dict)]
-                arr = o['host']
-                shape = tuple(int(s) for s in o['shape'])
-                if all(s > 0 for s in shape):
-                    arr = arr.reshape(shape)
-                out_dict[binding] = arr
+        # Return output with proper shape
+        output_data = self.outputs[0]['host']
+        output_shape = self.outputs[0]['shape']
         
-        return out_dict
+        # Reshape to proper dimensions if we have shape info
+        if output_shape and len(output_shape) > 1:
+            output_data = output_data.reshape(output_shape)
+        
+        return output_data
 
 
 class GlaucomaApplication(tk.Tk):
@@ -240,7 +233,6 @@ class GlaucomaApplication(tk.Tk):
 
         # Handle EfficientNMS (4 outputs: num_dets, boxes, scores, classes)
         if isinstance(outputs, dict):
-            # Try common names first
             keys = list(outputs.keys())
             def pick(name_opts):
                 for k in name_opts:
@@ -253,20 +245,16 @@ class GlaucomaApplication(tk.Tk):
             scores = pick(["det_scores", "scores", "nmsed_scores"])
             classes = pick(["det_classes", "classes", "nmsed_classes"])
 
-            # If we found the NMS quartet, use it
             if boxes is not None and scores is not None and classes is not None:
                 try:
                     n = int(num_dets[0]) if num_dets is not None else min(100, boxes.shape[1])
-                    self.log_to_console(f"EfficientNMS: Processing {n} detections from NMS")
+                    self.log_to_console(f"EfficientNMS: Processing {n} detections")
 
-                    # Extract valid detections
                     boxes_slice = boxes[0, :n]     # (n, 4) xyxy on input scale
                     scores_slice = scores[0, :n]   # (n,) confidence scores
                     classes_slice = classes[0, :n].astype(int)  # (n,) class IDs
 
                     oh, ow = orig_shape[:2]
-                    valid_count = 0
-
                     for i in range(n):
                         conf = float(scores_slice[i])
                         if conf < self.conf_threshold:
@@ -294,22 +282,13 @@ class GlaucomaApplication(tk.Tk):
                                 "class_id": cid,
                                 "class_name": self.class_names.get(cid, f"class_{cid}")
                             })
-                            valid_count += 1
 
-                    self.log_to_console(f"Found {valid_count} valid detections after EfficientNMS processing")
+                    self.log_to_console(f"Found {len(detections)} valid detections after EfficientNMS processing")
                     return detections  # Return directly, NMS already done
 
                 except Exception as e:
                     self.log_to_console(f"Error processing EfficientNMS outputs: {e}")
                     # Fall through to legacy processing
-            else:
-                self.log_to_console(f"Could not find NMS outputs in keys: {keys}")
-                # Try to use the first output as fallback
-                if keys:
-                    outputs = outputs[keys[0]]
-                    self.log_to_console(f"Using fallback output: {keys[0]} with shape {outputs.shape}")
-                else:
-                    return []
 
         # Handle single-tensor output format (YOLO-style output)
         if not isinstance(outputs, dict):
@@ -321,50 +300,20 @@ class GlaucomaApplication(tk.Tk):
                 batch_size, num_anchors, num_features = outputs.shape
 
                 # Get number of classes from the model
-                num_classes = len(self.class_names) if hasattr(self, 'class_names') else 4
+                num_classes = len(self.class_names)
                 expected_features = num_classes + 5  # 4 classes + 5 bbox/conf features
 
                 self.log_to_console(f"Expected features: {expected_features}, Actual features: {num_features}")
 
-                # Debug: Print some sample values to understand the output format
-                if not hasattr(self, '_tensor_debugged'):
-                    self.log_to_console("Sample output values (first anchor):")
-                    sample = outputs[0, 0, :min(10, num_features)]
-                    self.log_to_console(f"First 10 features: {sample}")
-                    self._tensor_debugged = True
-
-                # Handle different possible output formats
-                if num_features == expected_features:
-                    # Standard YOLO format
-                    boxes_xywh = outputs[0, :, :4]  # x, y, w, h (center format)
-                    obj_conf = outputs[0, :, 4:5]  # object confidence
-                    class_probs = outputs[0, :, 5:5+num_classes]  # class probabilities
-                elif num_features == 5 + 80:  # COCO format
-                    # If it's COCO format, we need to handle class mapping
-                    self.log_to_console("Detected COCO format output, mapping to glaucoma classes")
-                    boxes_xywh = outputs[0, :, :4]
-                    obj_conf = outputs[0, :, 4:5]
-                    # For glaucoma, we'll use specific COCO classes or default to first class
-                    class_probs = outputs[0, :, 5:5+num_classes]  # Take first N classes
-                else:
-                    # Unknown format - try to infer
-                    self.log_to_console(f"Unknown output format with {num_features} features")
-                    if num_features >= 5:
-                        boxes_xywh = outputs[0, :, :4]
-                        obj_conf = outputs[0, :, 4:5]
-                        class_probs = outputs[0, :, 5:min(5+num_classes, num_features)]
-                        if 5+num_classes > num_features:
-                            # Pad with zeros if needed
-                            padding = np.zeros((num_anchors, 5+num_classes - num_features))
-                            class_probs = np.concatenate([class_probs, padding], axis=1)
-                    else:
-                        self.log_to_console("Output format too small to parse")
-                        return []
+                # Extract boxes, confidence, and class probabilities
+                boxes_xywh = outputs[0, :, :4]  # x, y, w, h (center format)
+                obj_conf = outputs[0, :, 4:5]  # object confidence
+                class_probs = outputs[0, :, 5:5+num_classes]  # class probabilities
 
                 oh, ow = orig_shape[:2]
                 valid_count = 0
 
-                for i in range(min(num_anchors, 1000)):  # Limit to prevent too many iterations
+                for i in range(num_anchors):
                     # Get the best class and its confidence
                     class_confidences = class_probs[i] * obj_conf[i, 0]
                     best_class_id = int(np.argmax(class_confidences))
@@ -376,18 +325,12 @@ class GlaucomaApplication(tk.Tk):
                     # Extract box coordinates (center format -> corner format)
                     x_center, y_center, width, height = boxes_xywh[i]
 
-                    # Convert to float to avoid issues
-                    x_center = float(x_center)
-                    y_center = float(y_center)
-                    width = float(width)
-                    height = float(height)
-
                     # YOLO coordinates are typically normalized to [0, 1] relative to input size
                     # Scale to input size first
                     x_center *= self.input_size[0]
-                    y_center *= self.input_size[1] if len(self.input_size) > 1 else self.input_size[0]
+                    y_center *= self.input_size[1]
                     width *= self.input_size[0]
-                    height *= self.input_size[1] if len(self.input_size) > 1 else self.input_size[0]
+                    height *= self.input_size[1]
 
                     # Convert center format to corner format
                     x1 = x_center - width / 2
