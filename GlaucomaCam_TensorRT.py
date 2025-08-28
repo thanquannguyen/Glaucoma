@@ -308,48 +308,56 @@ class GlaucomaApplication(tk.Tk):
                             self.log_to_console(f"Transform params: scale={scale:.3f}, dx={dx}, dy={dy}")
                             self.log_to_console(f"Input size: {self.input_size}, Original shape: {orig_shape}")
                         
-                        # Try multiple coordinate transformation approaches
-                        # Approach 1: Standard YOLO format (assume coordinates are in input image space)
+                        # USE THE SAME METHOD AS THE ORIGINAL WORKING CODE
+                        # Based on deploy/triton-inference-server/processing.py approach
                         
-                        # Check if coordinates look normalized (0-1 range)
-                        max_coord = max(x_center, y_center, width, height)
-                        is_likely_normalized = max_coord <= 1.0
+                        orig_h, orig_w = orig_shape[:2]
+                        
+                        # Convert center format to corner format in input space
+                        x1_input = x_center - width / 2
+                        y1_input = y_center - height / 2
+                        x2_input = x_center + width / 2
+                        y2_input = y_center + height / 2
                         
                         if debug_this:
-                            self.log_to_console(f"Max coordinate: {max_coord:.3f}, likely normalized: {is_likely_normalized}")
+                            self.log_to_console(f"Input space corners: ({x1_input:.1f}, {y1_input:.1f}) to ({x2_input:.1f}, {y2_input:.1f})")
                         
-                        # Method 1: Treat as normalized coordinates
-                        if is_likely_normalized:
-                            # Direct scaling to original image size (skip input size)
-                            orig_h, orig_w = orig_shape[:2]
-                            x1_v1 = int((x_center - width/2) * orig_w)
-                            y1_v1 = int((y_center - height/2) * orig_h)
-                            x2_v1 = int((x_center + width/2) * orig_w)
-                            y2_v1 = int((y_center + height/2) * orig_h)
+                        # Normalize by input size (like line 29 in processing.py)
+                        x1_norm = x1_input / self.input_size[0]
+                        y1_norm = y1_input / self.input_size[1]
+                        x2_norm = x2_input / self.input_size[0]
+                        y2_norm = y2_input / self.input_size[1]
+                        
+                        if debug_this:
+                            self.log_to_console(f"Normalized: ({x1_norm:.3f}, {y1_norm:.3f}) to ({x2_norm:.3f}, {y2_norm:.3f})")
+                        
+                        # Calculate resized dimensions (like lines 33-41 in processing.py)
+                        if (orig_w / self.input_size[0]) >= (orig_h / self.input_size[1]):
+                            old_h = int(self.input_size[1] * orig_w / self.input_size[0])
+                            offset_h = (old_h - orig_h) // 2
+                            offset_w = 0
                         else:
-                            # Method 2: Treat as input space coordinates with padding removal
-                            x1_input = x_center - width / 2
-                            y1_input = y_center - height / 2
-                            x2_input = x_center + width / 2
-                            y2_input = y_center + height / 2
-                            
-                            # Remove padding
-                            x1_resized = x1_input - dx
-                            y1_resized = y1_input - dy
-                            x2_resized = x2_input - dx
-                            y2_resized = y2_input - dy
-                            
-                            # Scale to original
-                            x1_v1 = int(x1_resized / scale)
-                            y1_v1 = int(y1_resized / scale)
-                            x2_v1 = int(x2_resized / scale)
-                            y2_v1 = int(y2_resized / scale)
+                            old_w = int(self.input_size[0] * orig_h / self.input_size[1])
+                            offset_w = (old_w - orig_w) // 2
+                            offset_h = 0
+                            old_h = orig_h
+                            if 'old_w' not in locals():
+                                old_w = orig_w
                         
-                        # Use the calculated coordinates
-                        x1, y1, x2, y2 = x1_v1, y1_v1, x2_v1, y2_v1
+                        # Scale to original size (like line 43 in processing.py)
+                        x1_scaled = x1_norm * old_w
+                        y1_scaled = y1_norm * old_h
+                        x2_scaled = x2_norm * old_w
+                        y2_scaled = y2_norm * old_h
+                        
+                        # Remove offset (like line 45 in processing.py)
+                        x1 = int(x1_scaled - offset_w)
+                        y1 = int(y1_scaled - offset_h)
+                        x2 = int(x2_scaled - offset_w)
+                        y2 = int(y2_scaled - offset_h)
                         
                         if debug_this:
-                            self.log_to_console(f"Method used: {'Normalized direct' if is_likely_normalized else 'Input space with padding'}")
+                            self.log_to_console(f"Scale params: old_w={old_w}, old_h={old_h}, offset_w={offset_w}, offset_h={offset_h}")
                             self.log_to_console(f"Final coordinates: ({x1}, {y1}) to ({x2}, {y2})")
                             if len(detections) >= 2:
                                 self._coord_debug_shown = True
