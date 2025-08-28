@@ -149,8 +149,18 @@ class ONNXToTensorRTConverter:
         if engine_dir:  # Only create directory if there's a directory component
             os.makedirs(engine_dir, exist_ok=True)
         
-        with open(self.engine_path, 'wb') as f:
-            f.write(engine.serialize())
+        try:
+            serialized_engine = engine.serialize()
+            with open(self.engine_path, 'wb') as f:
+                if hasattr(serialized_engine, 'tobytes'):
+                    # TensorRT IHostMemory object
+                    f.write(serialized_engine.tobytes())
+                else:
+                    # Regular bytes object
+                    f.write(serialized_engine)
+        except Exception as e:
+            logger.error(f"Failed to serialize and save engine: {e}")
+            raise
         
         logger.info(f"Engine saved successfully: {self.engine_path}")
         
@@ -175,8 +185,18 @@ class ONNXToTensorRTConverter:
             logger.info(f"  Is Input: {is_input}")
         
         # Get engine size
-        engine_size = len(engine.serialize()) / (1024 * 1024)  # MB
-        logger.info(f"Engine size: {engine_size:.2f} MB")
+        try:
+            serialized_engine = engine.serialize()
+            if hasattr(serialized_engine, 'tobytes'):
+                # TensorRT IHostMemory object
+                engine_bytes = serialized_engine.tobytes()
+                engine_size = len(engine_bytes) / (1024 * 1024)  # MB
+            else:
+                # Regular bytes object
+                engine_size = len(serialized_engine) / (1024 * 1024)  # MB
+            logger.info(f"Engine size: {engine_size:.2f} MB")
+        except Exception as e:
+            logger.warning(f"Could not determine engine size: {e}")
     
     def convert(self):
         """Main conversion method"""
