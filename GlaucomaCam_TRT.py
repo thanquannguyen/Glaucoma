@@ -115,19 +115,47 @@ class TRTDetector:
         """
         H_in, W_in = input_hw
         H0, W0 = orig_hw
-        pad_x, pad_y = pad
-        
-        # The output of a standard YOLO model is typically (1, num_classes + 4, num_proposals)
-        # We need to transpose it to (num_proposals, num_classes + 4)
-        output = outputs[0].squeeze().T 
-        
-        # In this format, each row is a detection proposal: [cx, cy, w, h, class_prob_1, class_prob_2, ...]
-        boxes_coords = output[:, :4]
-        scores = output[:, 4:]
+        pad_left, pad_top = pad  # Fix: letterbox returns (left, top)
 
-        # Get the class ID and confidence score for each proposal
-        class_ids = np.argmax(scores, axis=1)
-        confidences = np.max(scores, axis=1)
+        # Handle different output formats
+        if len(outputs) == 0:
+            return []
+
+        output = outputs[0]
+
+        # Check output shape and format
+        if output.ndim == 3:
+            # Format: (1, num_proposals, num_classes + 4)
+            output = output.squeeze(0)  # Remove batch dimension
+        elif output.ndim == 2:
+            # Format: (num_proposals, num_classes + 4) - already correct
+            pass
+        else:
+            # Log warning for unexpected shapes
+            print(f"Warning: Unexpected output shape: {output.shape}, expected 2D or 3D")
+            return []
+
+        if output.shape[0] == 0:
+            return []
+
+        if output.shape[1] < 5:
+            print(f"Warning: Output has {output.shape[1]} columns, expected at least 5 (cx,cy,w,h,conf)")
+            return []
+
+        # In YOLO format: [cx, cy, w, h, obj_conf, class_prob_1, class_prob_2, ...]
+        boxes_coords = output[:, :4]  # [cx, cy, w, h]
+        obj_conf = output[:, 4]  # Object confidence
+
+        if output.shape[1] > 5:
+            # Multiple classes: take max class probability
+            class_confs = output[:, 5:]
+            class_ids = np.argmax(class_confs, axis=1)
+            class_conf_max = np.max(class_confs, axis=1)
+            confidences = obj_conf * class_conf_max
+        else:
+            # Single class or binary classification
+            class_ids = np.zeros(len(output), dtype=int)
+            confidences = obj_conf
 
         # Filter out detections below the confidence threshold
         mask = confidences > self.conf_threshold
@@ -138,50 +166,70 @@ class TRTDetector:
         if len(boxes_coords) == 0:
             return []
 
-        # The model outputs normalized [center_x, center_y, width, height]
-        # We must scale them to pixel coordinates in the letterboxed image space
-        boxes_coords[:, 0] *= W_in  # center_x
-        boxes_coords[:, 1] *= H_in  # center_y
-        boxes_coords[:, 2] *= W_in  # width
-        boxes_coords[:, 3] *= H_in  # height
+        # Check if coordinates are normalized (typically 0-1 range)
+        # Be more conservative with the threshold to avoid false positives
+        if np.max(boxes_coords) <= 1.1:
+            # Scale normalized coordinates to letterboxed image space
+            boxes_coords[:, [0, 2]] *= W_in  # cx, w
+            boxes_coords[:, [1, 3]] *= H_in  # cy, h
 
-        # Convert [center_x, center_y, width, height] to [x, y, w, h] for NMS
-        # Note: cv2.dnn.NMSBoxes expects [x_top_left, y_top_left, width, height]
-        x = boxes_coords[:, 0] - boxes_coords[:, 2] / 2
-        y = boxes_coords[:, 1] - boxes_coords[:, 3] / 2
-        w = boxes_coords[:, 2]
-        h = boxes_coords[:, 3]
-        
-        nms_boxes = [[int(val) for val in box] for box in zip(x, y, w, h)]
-        
+        # Convert [center_x, center_y, width, height] to [x1, y1, x2, y2]
+        cx, cy, w, h = boxes_coords[:, 0], boxes_coords[:, 1], boxes_coords[:, 2], boxes_coords[:, 3]
+        x1 = cx - w / 2
+        y1 = cy - h / 2
+        x2 = cx + w / 2
+        y2 = cy + h / 2
+
+        # Prepare boxes for NMS (cv2.dnn.NMSBoxes expects [x, y, w, h])
+        nms_boxes = []
+        for i in range(len(x1)):
+            box_x1, box_y1, box_x2, box_y2 = x1[i], y1[i], x2[i], y2[i]
+            box_w = box_x2 - box_x1
+            box_h = box_y2 - box_y1
+            nms_boxes.append([int(box_x1), int(box_y1), int(box_w), int(box_h)])
+
         # Perform Non-Maximum Suppression (NMS)
-        indices = cv2.dnn.NMSBoxes(nms_boxes, confidences, self.conf_threshold, self.iou_threshold)
-        
-        if len(indices) == 0:
+        try:
+            indices = cv2.dnn.NMSBoxes(nms_boxes, confidences.tolist(), self.conf_threshold, self.iou_threshold)
+            if len(indices) == 0:
+                return []
+            # Handle different OpenCV versions
+            if isinstance(indices, np.ndarray) and indices.ndim > 1:
+                indices = indices.flatten()
+        except Exception as e:
+            self.logger.log(trt.Logger.WARNING, f"NMS failed: {e}")
             return []
-
-        # Flatten indices if it's a nested list
-        indices = indices.flatten()
 
         detections = []
         for i in indices:
+            if isinstance(i, (list, np.ndarray)):
+                i = i[0] if len(i) > 0 else 0
+
             # Get the box coordinates in the letterboxed image space
             box_x, box_y, box_w, box_h = nms_boxes[i]
-            
+
             # Map coordinates back from letterboxed space to original image space
-            final_x1 = (box_x - pad_x) / scale
-            final_y1 = (box_y - pad_y) / scale
-            final_x2 = (box_x + box_w - pad_x) / scale
-            final_y2 = (box_y + box_h - pad_y) / scale
+            final_x1 = (box_x - pad_left) / scale
+            final_y1 = (box_y - pad_top) / scale
+            final_x2 = (box_x + box_w - pad_left) / scale
+            final_y2 = (box_y + box_h - pad_top) / scale
 
-            # Clip coordinates to ensure they are within the image boundaries
-            final_x1 = float(np.clip(final_x1, 0, W0 - 1))
-            final_y1 = float(np.clip(final_y1, 0, H0 - 1))
-            final_x2 = float(np.clip(final_x2, 0, W0 - 1))
-            final_y2 = float(np.clip(final_y2, 0, H0 - 1))
+            # Ensure minimum box size and clip coordinates
+            final_x1 = max(0, min(final_x1, W0 - 1))
+            final_y1 = max(0, min(final_y1, H0 - 1))
+            final_x2 = max(0, min(final_x2, W0 - 1))
+            final_y2 = max(0, min(final_y2, H0 - 1))
 
-            detections.append([final_x1, final_y1, final_x2, final_y2, float(confidences[i]), int(class_ids[i])])
-            
+            # Skip very small boxes
+            if (final_x2 - final_x1) < 2 or (final_y2 - final_y1) < 2:
+                continue
+
+            detections.append([
+                float(final_x1), float(final_y1),
+                float(final_x2), float(final_y2),
+                float(confidences[i]), int(class_ids[i])
+            ])
+
         return detections
 
     def infer(self, image_bgr):
@@ -221,7 +269,7 @@ class TRTDetector:
         outputs = [out.reshape(self.engine.get_binding_shape(i+1)) for i, out in enumerate(self.host_outputs)]
         
         H0, W0 = image_bgr.shape[:2]
-        detections = self._postprocess(outputs, (H, W), (H0, W0), pad, scale)
+        detections = self._postprocess(outputs, (W, H), (W0, H0), pad, scale)
         
         return detections
 
@@ -735,7 +783,39 @@ class GlaucomaApplicationTRT(tk.Tk):
             self.cap.release()
         self.destroy()
 
+def test_bounding_boxes():
+    """
+    Simple test function to verify bounding box detection.
+    Call this function to test with a sample image.
+    """
+    try:
+        # Initialize detector
+        detector = TRTDetector(
+            "model_results/runs/train/glaucoma_yolo11/weights/best.engine",
+            conf_threshold=0.25,
+            iou_threshold=0.45
+        )
+
+        # Test with a sample image
+        test_image = np.random.randint(0, 255, (640, 640, 3), dtype=np.uint8)
+
+        print("Testing bounding box detection...")
+        detections = detector.infer(test_image)
+
+        print(f"Found {len(detections)} detections:")
+        for i, det in enumerate(detections):
+            x1, y1, x2, y2, conf, cls_id = det
+            print(f"  Detection {i}: Class {cls_id}, Conf {conf:.3f}, Box [{x1:.1f}, {y1:.1f}, {x2:.1f}, {y2:.1f}]")
+
+        return True
+    except Exception as e:
+        print(f"Test failed: {e}")
+        return False
+
 if __name__ == "__main__":
+    # Uncomment the line below to run a quick test
+    # test_bounding_boxes()
+
     app = GlaucomaApplicationTRT()
     app.protocol("WM_DELETE_WINDOW", app.on_closing)
     app.mainloop()
