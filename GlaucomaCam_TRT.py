@@ -138,12 +138,8 @@ class TRTDetector:
         if len(boxes_coords) == 0:
             return []
 
-        # The model outputs normalized [center_x, center_y, width, height]
-        # We must scale them to pixel coordinates in the letterboxed image space
-        boxes_coords[:, 0] *= W_in  # center_x
-        boxes_coords[:, 1] *= H_in  # center_y
-        boxes_coords[:, 2] *= W_in  # width
-        boxes_coords[:, 3] *= H_in  # height
+        # The model outputs pixel coordinates [center_x, center_y, width, height]
+        # relative to the letterboxed input image. We no longer need to scale them.
 
         # Convert [center_x, center_y, width, height] to [x, y, w, h] for NMS
         # Note: cv2.dnn.NMSBoxes expects [x_top_left, y_top_left, width, height]
@@ -746,4 +742,4 @@ class GlaucomaApplicationTRT(tk.Tk):
 if __name__ == "__main__":
     app = GlaucomaApplicationTRT()
     app.protocol("WM_DELETE_WINDOW", app.on_closing)
-    app.mainloop()
+    app.mainloo
