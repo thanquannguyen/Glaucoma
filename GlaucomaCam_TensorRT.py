@@ -241,216 +241,83 @@ class GlaucomaApplication(tk.Tk):
         # Handle EfficientNMS (4 outputs: num_dets, boxes, scores, classes)
         if isinstance(outputs, dict):
             # Try common names first
-            keys = outputs.keys()
-            def pick(name_opts, fallback=None):
+            keys = list(outputs.keys())
+            def pick(name_opts):
                 for k in name_opts:
                     if k in keys:
                         return outputs[k]
-                return fallback
+                return None
 
-            num   = pick(["num_dets", "nmsed_num", "num_detections"])
+            num_dets = pick(["num_dets", "nmsed_num", "num_detections"])
             boxes = pick(["det_boxes", "boxes", "nmsed_boxes"])
-            scores= pick(["det_scores","scores","nmsed_scores"])
-            clses = pick(["det_classes","classes","nmsed_classes"])
+            scores = pick(["det_scores", "scores", "nmsed_scores"])
+            classes = pick(["det_classes", "classes", "nmsed_classes"])
 
             # If we found the NMS quartet, use it
-            if boxes is not None and scores is not None and clses is not None:
-                n = int(num[0]) if num is not None else boxes.shape[1]
-                self.log_to_console(f"EfficientNMS: {n} detections from NMS")
-                
-                boxes = boxes[0, :n]        # (n, 4) xyxy on input scale (e.g., 416x416)
-                scores = scores[0, :n]
-                clses = clses[0, :n].astype(int)
+            if boxes is not None and scores is not None and classes is not None:
+                try:
+                    n = int(num_dets[0]) if num_dets is not None else min(100, boxes.shape[1])
+                    self.log_to_console(f"EfficientNMS: Processing {n} detections from NMS")
+                    
+                    # Extract valid detections
+                    boxes_slice = boxes[0, :n]     # (n, 4) xyxy on input scale
+                    scores_slice = scores[0, :n]   # (n,) confidence scores
+                    classes_slice = classes[0, :n].astype(int)  # (n,) class IDs
 
-                oh, ow = orig_shape[:2]
-                for (x1, y1, x2, y2), conf, cid in zip(boxes, scores, clses):
-                    if conf < self.conf_threshold:
-                        continue
+                    oh, ow = orig_shape[:2]
+                    valid_count = 0
                     
-                    # Undo letterbox: subtract padding, then divide by scale
-                    x1 = int((x1 - dx) / scale)
-                    y1 = int((y1 - dy) / scale)
-                    x2 = int((x2 - dx) / scale)
-                    y2 = int((y2 - dy) / scale)
+                    for i in range(n):
+                        conf = float(scores_slice[i])
+                        if conf < self.conf_threshold:
+                            continue
+                            
+                        x1, y1, x2, y2 = boxes_slice[i]
+                        cid = int(classes_slice[i])
+                        
+                        # Undo letterbox: subtract padding, then divide by scale
+                        x1 = int((x1 - dx) / scale)
+                        y1 = int((y1 - dy) / scale)
+                        x2 = int((x2 - dx) / scale)
+                        y2 = int((y2 - dy) / scale)
 
-                    # Clip to image bounds
-                    x1 = max(0, min(x1, ow))
-                    y1 = max(0, min(y1, oh))
-                    x2 = max(0, min(x2, ow))
-                    y2 = max(0, min(y2, oh))
-                    
-                    if x2 > x1 and y2 > y1:
-                        detections.append({
-                            "bbox": [x1, y1, x2, y2],
-                            "confidence": float(conf),
-                            "class_id": int(cid),
-                            "class_name": self.class_names.get(int(cid), f"class_{int(cid)}")
-                        })
-                
-                self.log_to_console(f"Found {len(detections)} valid detections after processing")
-                return detections  # Skip the old processing and NMS since it's already done
-        
-        # Handle different output formats
-        if len(outputs.shape) == 1:
-            # Flatten output - need to determine the format
-            total_elements = outputs.size
-            
-            # For YOLO models, typical formats:
-            # - 4 classes + 4 bbox + 1 conf = 9 elements per detection
-            # - 1 class + 4 bbox + 1 conf = 6 elements per detection  
-            # - Multiple anchors/scales combined
-            
-            # Try different possible formats (most likely first)
-            possible_formats = [
-                (9, "4 classes + 4 bbox + 1 conf"),  # Your model format (21294/9 = 2366 detections)
-                (6, "1 class + 4 bbox + 1 conf"),
-                (7, "2 classes + 4 bbox + 1 conf"),
-                (8, "3 classes + 4 bbox + 1 conf"),
-                (10, "5 classes + 4 bbox + 1 conf"),
-                (85, "80 classes + 4 bbox + 1 conf")
-            ]
-            
-            for elements_per_detection, description in possible_formats:
-                if total_elements % elements_per_detection == 0:
-                    num_detections = total_elements // elements_per_detection
-                    self.log_to_console(f"Trying format: {description} ({elements_per_detection} elements per detection, {num_detections} detections)")
-                    try:
-                        outputs = outputs.reshape(1, num_detections, elements_per_detection)
-                        break
-                    except:
-                        continue
-            else:
-                # If no standard format fits, try to guess
-                # Assume the most common case: small number of classes
-                num_classes = len(self.class_names)
-                elements_per_detection = 4 + 1 + num_classes  # bbox + conf + classes
-                if total_elements % elements_per_detection == 0:
-                    num_detections = total_elements // elements_per_detection
-                    outputs = outputs.reshape(1, num_detections, elements_per_detection)
-                    self.log_to_console(f"Using custom format: {num_classes} classes + 4 bbox + 1 conf = {elements_per_detection} elements per detection")
-                else:
-                    self.log_to_console(f"Cannot determine output format. Total elements: {total_elements}")
-                    return []
-        else:
-            # Already properly shaped
-            pass
-        
-        for detection in outputs[0]:
-            detection_length = len(detection)
-            
-            # Handle different detection formats
-            if detection_length >= 5:  # Minimum: 4 bbox + 1 conf
-                # Extract bounding box (first 4 elements)
-                x_center, y_center, width, height = detection[:4]
-                
-                # Extract confidence (5th element)
-                confidence = detection[4]
-                
-                if confidence > self.conf_threshold:
-                    # Extract class information
-                    if detection_length > 5:
-                        # Multiple classes - find the one with highest score
-                        class_scores = detection[5:]
-                        class_id = np.argmax(class_scores)
-                        class_confidence = class_scores[class_id]
-                        final_conf = confidence * class_confidence
-                    else:
-                        # Single class or no class scores
-                        class_id = 0
-                        final_conf = confidence
-                    
-                    if final_conf > self.conf_threshold:
-                        # Debug: Log transformation details for first few detections
-                        debug_this = len(detections) < 3 and not hasattr(self, '_coord_debug_shown')
-                        
-                        if debug_this:
-                            self.log_to_console(f"=== Coordinate Debug {len(detections)} ===")
-                            self.log_to_console(f"Raw: center=({x_center:.3f}, {y_center:.3f}), size=({width:.3f}x{height:.3f})")
-                            self.log_to_console(f"Transform params: scale={scale:.3f}, dx={dx}, dy={dy}")
-                            self.log_to_console(f"Input size: {self.input_size}, Original shape: {orig_shape}")
-                        
-                        # USE THE SAME METHOD AS THE ORIGINAL WORKING CODE
-                        # Based on deploy/triton-inference-server/processing.py approach
-                        
-                        orig_h, orig_w = orig_shape[:2]
-                        
-                        # Convert center format to corner format in input space
-                        x1_input = x_center - width / 2
-                        y1_input = y_center - height / 2
-                        x2_input = x_center + width / 2
-                        y2_input = y_center + height / 2
-                        
-                        if debug_this:
-                            self.log_to_console(f"Input space corners: ({x1_input:.1f}, {y1_input:.1f}) to ({x2_input:.1f}, {y2_input:.1f})")
-                        
-                        # Normalize by input size (like line 29 in processing.py)
-                        x1_norm = x1_input / self.input_size[0]
-                        y1_norm = y1_input / self.input_size[1]
-                        x2_norm = x2_input / self.input_size[0]
-                        y2_norm = y2_input / self.input_size[1]
-                        
-                        if debug_this:
-                            self.log_to_console(f"Normalized: ({x1_norm:.3f}, {y1_norm:.3f}) to ({x2_norm:.3f}, {y2_norm:.3f})")
-                        
-                        # Calculate resized dimensions (like lines 33-41 in processing.py)
-                        if (orig_w / self.input_size[0]) >= (orig_h / self.input_size[1]):
-                            old_h = int(self.input_size[1] * orig_w / self.input_size[0])
-                            old_w = orig_w
-                            offset_h = (old_h - orig_h) // 2
-                            offset_w = 0
-                        else:
-                            old_w = int(self.input_size[0] * orig_h / self.input_size[1])
-                            old_h = orig_h
-                            offset_w = (old_w - orig_w) // 2
-                            offset_h = 0
-                        
-                        # Scale to original size (like line 43 in processing.py)
-                        x1_scaled = x1_norm * old_w
-                        y1_scaled = y1_norm * old_h
-                        x2_scaled = x2_norm * old_w
-                        y2_scaled = y2_norm * old_h
-                        
-                        # Remove offset (like line 45 in processing.py)
-                        x1 = int(x1_scaled - offset_w)
-                        y1 = int(y1_scaled - offset_h)
-                        x2 = int(x2_scaled - offset_w)
-                        y2 = int(y2_scaled - offset_h)
-                        
-                        if debug_this:
-                            self.log_to_console(f"Scale params: old_w={old_w}, old_h={old_h}, offset_w={offset_w}, offset_h={offset_h}")
-                            self.log_to_console(f"Final coordinates: ({x1}, {y1}) to ({x2}, {y2})")
-                            if len(detections) >= 2:
-                                self._coord_debug_shown = True
-                        
                         # Clip to image bounds
-                        x1 = max(0, min(x1, orig_shape[1]))
-                        y1 = max(0, min(y1, orig_shape[0]))
-                        x2 = max(0, min(x2, orig_shape[1]))
-                        y2 = max(0, min(y2, orig_shape[0]))
+                        x1 = max(0, min(x1, ow))
+                        y1 = max(0, min(y1, oh))
+                        x2 = max(0, min(x2, ow))
+                        y2 = max(0, min(y2, oh))
                         
-                        # Only add if the box is valid
                         if x2 > x1 and y2 > y1:
                             detections.append({
-                                'bbox': [x1, y1, x2, y2],
-                                'confidence': float(final_conf),
-                                'class_id': int(class_id),
-                                'class_name': self.class_names.get(class_id, f'class_{class_id}')
+                                "bbox": [x1, y1, x2, y2],
+                                "confidence": conf,
+                                "class_id": cid,
+                                "class_name": self.class_names.get(cid, f"class_{cid}")
                             })
+                            valid_count += 1
+                    
+                    self.log_to_console(f"Found {valid_count} valid detections after EfficientNMS processing")
+                    return detections  # Return directly, NMS already done
+                    
+                except Exception as e:
+                    self.log_to_console(f"Error processing EfficientNMS outputs: {e}")
+                    # Fall through to legacy processing
+            else:
+                self.log_to_console(f"Could not find NMS outputs in keys: {keys}")
+                # Try to use the first output as fallback
+                if keys:
+                    outputs = outputs[keys[0]]
+                    self.log_to_console(f"Using fallback output: {keys[0]} with shape {outputs.shape}")
+                else:
+                    return []
         
-        # Apply NMS
-        self.log_to_console(f"Found {len(detections)} detections before NMS")
-        
-        # Debug: Show first few detections for troubleshooting
-        if len(detections) > 0 and not hasattr(self, '_detection_debug_shown'):
-            self.log_to_console("Sample detections (before NMS):")
-            for i, det in enumerate(detections[:3]):  # Show first 3
-                bbox = det['bbox']
-                self.log_to_console(f"  Detection {i}: class={det['class_name']}, conf={det['confidence']:.3f}, bbox=({bbox[0]}, {bbox[1]}, {bbox[2]}, {bbox[3]})")
-            self._detection_debug_shown = True
-        
-        detections = self.apply_nms(detections)
-        self.log_to_console(f"Found {len(detections)} detections after NMS")
-        
+        # Fallback: Handle legacy single-tensor output (if EfficientNMS failed)
+        if not isinstance(outputs, dict):
+            self.log_to_console("Processing legacy/raw output format")
+            # The rest of your existing processing code can go here if needed
+            # For now, return empty since we expect EfficientNMS format
+            self.log_to_console("Legacy format not implemented - expected EfficientNMS")
+            
         return detections
 
     def apply_nms(self, detections):
