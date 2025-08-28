@@ -178,6 +178,10 @@ class TRTDetector:
             boxes = outputs[1].reshape(-1, 4)[:num]
             scores = outputs[2].reshape(-1)[:num]
             classes = outputs[3].reshape(-1)[:num].astype(int)
+            # If coordinates look normalized (<=1.5), scale to letterboxed pixels
+            if boxes.size and np.max(boxes) <= 1.5:
+                scale_vec = np.array([W_in, H_in, W_in, H_in], dtype=boxes.dtype)
+                boxes = boxes * scale_vec
             for b, s, c in zip(boxes, scores, classes):
                 if s < self.conf_threshold:
                     continue
@@ -222,6 +226,11 @@ class TRTDetector:
             x1y1 = xy - wh / 2
             x2y2 = xy + wh / 2
             boxes_xyxy = np.concatenate([x1y1, x2y2], axis=1)
+
+            # If normalized, scale to letterboxed pixel coords
+            if boxes_xyxy.size and np.max(boxes_xyxy) <= 1.5:
+                scale_vec = np.array([W_in, H_in, W_in, H_in], dtype=boxes_xyxy.dtype)
+                boxes_xyxy = boxes_xyxy * scale_vec
 
             # Map back to original image
             boxes_mapped = []
