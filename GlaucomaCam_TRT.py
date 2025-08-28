@@ -571,9 +571,11 @@ class GlaucomaApplicationTRT(tk.Tk):
         result = {'has_glaucoma': False, 'confidence': 0.0, 'detected_features': [], 'annotated_image': frame.copy()}
         try:
             detections = self.detector.infer(frame)
+            self.log_to_console(f"DEBUG: Inference returned {len(detections)} detections.")
             annotated_frame = frame.copy()
             
             for x1, y1, x2, y2, conf, cls_id in detections:
+                self.log_to_console(f"DEBUG: Drawing box with coords=({int(x1)}, {int(y1)}), ({int(x2)}, {int(y2)})")
                 x1, y1, x2, y2 = map(int, [x1, y1, x2, y2])
                 class_name = self._get_class_name(cls_id)
                 
@@ -690,6 +692,10 @@ class GlaucomaApplicationTRT(tk.Tk):
             fps = 1 / (time.time() - start_time)
             self.total_fps.append(fps)
 
+            # Log detections for debugging
+            if self.processing_started and len(detections) > 0:
+                 self.log_to_console(f"DEBUG: Live detection found {len(detections)} boxes.")
+
             self.boxes = [(d[0], d[1], d[2], d[3]) for d in detections]
             self.confs = [d[4] for d in detections]
             self.clss = [d[5] for d in detections]
@@ -721,7 +727,7 @@ class GlaucomaApplicationTRT(tk.Tk):
             self.log_to_console(f"Error updating camera display: {e}")
 
     def log_to_console(self, message):
-        timestamp = datetime.now().strftime("%H:%M%S")
+        timestamp = datetime.now().strftime("%H:%M:%S")
         formatted_message = f"[{timestamp}] {message}\n"
         self.console_log.config(state='normal')
         self.console_log.insert(tk.END, formatted_message)
