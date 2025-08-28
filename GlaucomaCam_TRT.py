@@ -74,6 +74,15 @@ class TRTDetector:
         # CUDA stream
         self.stream = cuda.Stream()
 
+        # Parsing controls via environment
+        self.force_format = (os.environ.get("GL_TRT_BOX_FORMAT", "auto").strip().lower())  # 'auto'|'xyxy'|'cxcywh'
+        self.force_normalized = (os.environ.get("GL_TRT_BOX_NORMALIZED", "auto").strip().lower())  # 'auto'|'1'|'0'
+        try:
+            self.class_offset = int(os.environ.get("GL_TRT_CLASS_OFFSET", "0").strip())
+        except Exception:
+            self.class_offset = 0
+        self.debug = os.environ.get("GL_TRT_DEBUG", "0").strip() in ("1", "true", "yes")
+
     def _determine_input_shape(self):
         shape = self.engine.get_binding_shape(self.input_index)
         # Static shape
@@ -165,6 +174,54 @@ class TRTDetector:
             order = order[inds + 1]
         return keep
 
+    def _apply_classwise_nms(self, dets, iou_thres):
+        if not dets:
+            return dets
+        dets = np.array(dets, dtype=np.float32)
+        classes = dets[:, 5].astype(np.int32)
+        keep_all = []
+        for cls_id in np.unique(classes):
+            idxs = np.where(classes == cls_id)[0]
+            boxes = dets[idxs, 0:4]
+            scores = dets[idxs, 4]
+            keep_idx_rel = self._nms(boxes, scores, iou_thres)
+            keep_all.extend(idxs[keep_idx_rel].tolist())
+        keep_all = sorted(set(keep_all))
+        return [dets[i].tolist() for i in keep_all]
+
+    def _map_to_original(self, x1, y1, x2, y2, pad_x, pad_y, sx, sy, W0, H0):
+        x1 = (x1 - pad_x) / sx
+        y1 = (y1 - pad_y) / sy
+        x2 = (x2 - pad_x) / sx
+        y2 = (y2 - pad_y) / sy
+        x1 = float(np.clip(x1, 0, W0 - 1))
+        y1 = float(np.clip(y1, 0, H0 - 1))
+        x2 = float(np.clip(x2, 0, W0 - 1))
+        y2 = float(np.clip(y2, 0, H0 - 1))
+        return x1, y1, x2, y2
+
+    def _choose_best_mapping(self, b, pad_x, pad_y, sx, sy, W0, H0):
+        # Candidate A: assume b is letterboxed coords → map back
+        xa1, ya1, xa2, ya2 = self._map_to_original(b[0], b[1], b[2], b[3], pad_x, pad_y, sx, sy, W0, H0)
+        area_a = max(0.0, xa2 - xa1) * max(0.0, ya2 - ya1)
+        # Candidate B: assume b is already original coords → use directly
+        xb1 = float(np.clip(b[0], 0, W0 - 1))
+        yb1 = float(np.clip(b[1], 0, H0 - 1))
+        xb2 = float(np.clip(b[2], 0, W0 - 1))
+        yb2 = float(np.clip(b[3], 0, H0 - 1))
+        area_b = max(0.0, xb2 - xb1) * max(0.0, yb2 - yb1)
+        # Heuristic: choose the one with larger valid area and not degenerate at origin
+        def quality(x1, y1, x2, y2, area):
+            cx = (x1 + x2) * 0.5
+            cy = (y1 + y2) * 0.5
+            near_origin = (cx < 5 and cy < 5)
+            return (0 if near_origin else 1, area)
+        qa = quality(xa1, ya1, xa2, ya2, area_a)
+        qb = quality(xb1, yb1, xb2, yb2, area_b)
+        if qb > qa:
+            return xb1, yb1, xb2, yb2
+        return xa1, ya1, xa2, ya2
+
     def _parse_outputs(self, outputs, input_hw, orig_hw, pad, scale):
         # Try EfficientNMS 4-output layout: [num_dets], [boxes], [scores], [classes]
         dets = []
@@ -178,24 +235,40 @@ class TRTDetector:
             boxes = outputs[1].reshape(-1, 4)[:num]
             scores = outputs[2].reshape(-1)[:num]
             classes = outputs[3].reshape(-1)[:num].astype(int)
+            # Determine normalized
+            is_norm = None
+            if self.force_normalized in ("1", "true", "yes"):
+                is_norm = True
+            elif self.force_normalized in ("0", "false", "no"):
+                is_norm = False
             # If coordinates look normalized (<=1.5), scale to letterboxed pixels
-            if boxes.size and np.max(boxes) <= 1.5:
+            if is_norm is True or (is_norm is None and boxes.size and np.max(boxes) <= 1.5):
                 scale_vec = np.array([W_in, H_in, W_in, H_in], dtype=boxes.dtype)
                 boxes = boxes * scale_vec
+            # Convert center format if forced
+            if self.force_format == 'cxcywh':
+                cx, cy, w, h = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+                x1 = cx - w / 2
+                y1 = cy - h / 2
+                x2 = cx + w / 2
+                y2 = cy + h / 2
+                boxes = np.stack([x1, y1, x2, y2], axis=1)
             for b, s, c in zip(boxes, scores, classes):
                 if s < self.conf_threshold:
                     continue
+                # Try xyxy order
                 x1, y1, x2, y2 = b
-                # De-pad and scale back to original image
-                x1 = (x1 - pad_x) / sx
-                y1 = (y1 - pad_y) / sy
-                x2 = (x2 - pad_x) / sx
-                y2 = (y2 - pad_y) / sy
-                x1 = float(np.clip(x1, 0, W0 - 1))
-                y1 = float(np.clip(y1, 0, H0 - 1))
-                x2 = float(np.clip(x2, 0, W0 - 1))
-                y2 = float(np.clip(y2, 0, H0 - 1))
-                dets.append([x1, y1, x2, y2, float(s), int(c)])
+                X1a, Y1a, X2a, Y2a = self._choose_best_mapping([x1, y1, x2, y2], pad_x, pad_y, sx, sy, W0, H0)
+                area_a = max(0.0, X2a - X1a) * max(0.0, Y2a - Y1a)
+                # Try yx order fallback
+                y1b, x1b, y2b, x2b = b
+                X1b, Y1b, X2b, Y2b = self._choose_best_mapping([x1b, y1b, x2b, y2b], pad_x, pad_y, sx, sy, W0, H0)
+                area_b = max(0.0, X2b - X1b) * max(0.0, Y2b - Y1b)
+                if area_b > area_a and (X2b > X1b) and (Y2b > Y1b):
+                    X1a, Y1a, X2a, Y2a = X1b, Y1b, X2b, Y2b
+                dets.append([X1a, Y1a, X2a, Y2a, float(s), int(c) + self.class_offset])
+            # Extra safety NMS to reduce duplicates from some engines
+            dets = self._apply_classwise_nms(dets, self.iou_threshold)
             return dets
 
         # Generic Ultralytics-like output: (1, N, M) with [x,y,w,h,conf,cls...]
@@ -220,12 +293,15 @@ class TRTDetector:
             scores = scores[mask]
             cls_ids = cls_ids[mask]
 
-            # Convert xywh (center) to xyxy in letterboxed space
-            xy = boxes_xywh[:, :2]
-            wh = boxes_xywh[:, 2:4]
-            x1y1 = xy - wh / 2
-            x2y2 = xy + wh / 2
-            boxes_xyxy = np.concatenate([x1y1, x2y2], axis=1)
+            # Convert to xyxy in letterboxed space
+            if self.force_format == 'xyxy':
+                boxes_xyxy = boxes_xywh
+            else:
+                xy = boxes_xywh[:, :2]
+                wh = boxes_xywh[:, 2:4]
+                x1y1 = xy - wh / 2
+                x2y2 = xy + wh / 2
+                boxes_xyxy = np.concatenate([x1y1, x2y2], axis=1)
 
             # If normalized, scale to letterboxed pixel coords
             if boxes_xyxy.size and np.max(boxes_xyxy) <= 1.5:
@@ -235,19 +311,12 @@ class TRTDetector:
             # Map back to original image
             boxes_mapped = []
             for (x1, y1, x2, y2) in boxes_xyxy:
-                x1 = (x1 - pad_x) / sx
-                y1 = (y1 - pad_y) / sy
-                x2 = (x2 - pad_x) / sx
-                y2 = (y2 - pad_y) / sy
-                x1 = float(np.clip(x1, 0, W0 - 1))
-                y1 = float(np.clip(y1, 0, H0 - 1))
-                x2 = float(np.clip(x2, 0, W0 - 1))
-                y2 = float(np.clip(y2, 0, H0 - 1))
+                x1, y1, x2, y2 = self._choose_best_mapping([x1, y1, x2, y2], pad_x, pad_y, sx, sy, W0, H0)
                 boxes_mapped.append([x1, y1, x2, y2])
 
             # NMS
             keep = self._nms(boxes_mapped, scores.tolist(), self.iou_threshold)
-            dets = [[*boxes_mapped[i], float(scores[i]), int(cls_ids[i])] for i in keep]
+            dets = [[*boxes_mapped[i], float(scores[i]), int(cls_ids[i]) + self.class_offset] for i in keep]
             return dets
 
         # Unknown format
@@ -294,6 +363,12 @@ class TRTDetector:
         # Postprocess
         H0, W0 = image_bgr.shape[:2]
         detections = self._parse_outputs(outputs, (self.input_shape[2], self.input_shape[3]), (H0, W0), pad, scale)
+        if self.debug:
+            try:
+                dbg = ", ".join([f"[{int(d[5])}:{d[4]:.2f}]({int(d[0])},{int(d[1])},{int(d[2])},{int(d[3])})" for d in detections[:5]])
+                print(f"[TRT DEBUG] dets: {dbg}")
+            except Exception:
+                pass
         return detections
 
 
@@ -361,6 +436,17 @@ class GlaucomaApplicationTRT(tk.Tk):
             self.class_names = self._resolve_class_names(None)
             self.colors = [[np.random.randint(0, 255) for _ in range(3)] for _ in range(len(self.class_names))]
             self.log_to_console(f"TensorRT engine loaded: {self.model_path}")
+            # Log binding info for troubleshooting
+            try:
+                eng = self.detector.engine
+                for i in range(eng.num_bindings):
+                    name = eng.get_binding_name(i)
+                    shape = self.detector.context.get_binding_shape(i)
+                    dtype = eng.get_binding_dtype(i)
+                    io = 'input' if eng.binding_is_input(i) else 'output'
+                    self.log_to_console(f"Binding[{i}] {io} '{name}' shape={tuple(shape)} dtype={dtype}")
+            except Exception:
+                pass
             self.log_to_console(f"Classes: {list(self.class_names.values())}")
         except Exception as e:
             self.log_to_console(f"Engine loading failed: {e}")
@@ -851,6 +937,11 @@ class GlaucomaApplicationTRT(tk.Tk):
         try:
             # Run TRT inference
             detections = self.detector.infer(frame)
+            if getattr(self.detector, 'debug', False) and detections:
+                try:
+                    self.log_to_console(f"Parsed {len(detections)} detections; first: {detections[0]}")
+                except Exception:
+                    pass
             
             # Process detections
             annotated_frame = frame.copy()
