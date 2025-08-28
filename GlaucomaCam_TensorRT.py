@@ -22,7 +22,7 @@ logging.getLogger("tensorrt").setLevel(logging.ERROR)
 
 class TensorRTInference:
     """TensorRT inference engine for YOLO models"""
-    
+
     def __init__(self, engine_path, input_shape=(1, 3, 640, 640)):
         self.engine_path = engine_path
         self.input_shape = input_shape
@@ -32,74 +32,59 @@ class TensorRTInference:
         self.outputs = []
         self.bindings = []
         self.stream = None
-        
+
         self.load_engine()
-        
+
     def load_engine(self):
         """Load TensorRT engine from file"""
         TRT_LOGGER = trt.Logger(trt.Logger.ERROR)
-        
+
         with open(self.engine_path, "rb") as f, trt.Runtime(TRT_LOGGER) as runtime:
             self.engine = runtime.deserialize_cuda_engine(f.read())
-            
+
         self.context = self.engine.create_execution_context()
-        
+
         # Setup I/O bindings
         for binding in self.engine:
             binding_idx = self.engine.get_binding_index(binding)
             shape = self.engine.get_binding_shape(binding_idx)
             size = trt.volume(shape)
             dtype = trt.nptype(self.engine.get_binding_dtype(binding_idx))
-            
-            # Debug: Print binding information
-            print(f"Binding {binding_idx}: {binding}")
-            print(f"  Shape: {shape}")
-            print(f"  Size: {size}")
-            print(f"  Type: {dtype}")
-            print(f"  Is Input: {self.engine.binding_is_input(binding)}")
-            
+
             # Allocate host and device buffers
             host_mem = cuda.pagelocked_empty(size, dtype)
             device_mem = cuda.mem_alloc(host_mem.nbytes)
-            
+
             # Append the device buffer to device bindings
             self.bindings.append(int(device_mem))
-            
+
             # Append to the appropriate list
             if self.engine.binding_is_input(binding):
-                self.inputs.append({'host': host_mem, 'device': device_mem, 'shape': shape})
+                self.inputs.append({'name': binding, 'host': host_mem, 'device': device_mem, 'shape': shape})
             else:
-                self.outputs.append({'host': host_mem, 'device': device_mem, 'shape': shape})
-        
+                self.outputs.append({'name': binding, 'host': host_mem, 'device': device_mem, 'shape': shape})
+
         # Create stream
         self.stream = cuda.Stream()
-        
+
     def infer(self, input_data):
         """Run inference with TensorRT"""
         # Copy input data to host buffer
         np.copyto(self.inputs[0]['host'], input_data.ravel())
-        
+
         # Transfer input data to GPU
         cuda.memcpy_htod_async(self.inputs[0]['device'], self.inputs[0]['host'], self.stream)
-        
+
         # Run inference
         self.context.execute_async_v2(bindings=self.bindings, stream_handle=self.stream.handle)
-        
-        # Transfer predictions back from GPU
-        cuda.memcpy_dtoh_async(self.outputs[0]['host'], self.outputs[0]['device'], self.stream)
-        
-        # Synchronize stream
+
+        # Transfer output data back to host
+        for out in self.outputs:
+            cuda.memcpy_dtoh_async(out['host'], out['device'], self.stream)
         self.stream.synchronize()
-        
-        # Return output with proper shape
-        output_data = self.outputs[0]['host']
-        output_shape = self.outputs[0]['shape']
-        
-        # Reshape to proper dimensions if we have shape info
-        if output_shape and len(output_shape) > 1:
-            output_data = output_data.reshape(output_shape)
-        
-        return output_data
+
+        # Return the first output (assuming single output for YOLO)
+        return self.outputs[0]['host']
 
 
 class GlaucomaApplication(tk.Tk):
@@ -118,16 +103,16 @@ class GlaucomaApplication(tk.Tk):
         self.server_upload_url = os.environ.get("GL_UPLOAD_URL", "http://100.104.212.73:8002/uploads")
         self.server_record_url = os.environ.get("GL_RECORD_URL", "http://100.104.212.73:8002/record/create")
         self.server_cookie = os.environ.get("GL_SERVER_COOKIE", "")
-        
+
         # Mode control: 'camera' or 'image'
         self.detection_mode = 'camera'
         self.imported_image = None
         self.imported_image_path = None
         self.display_locked = False  # Prevent camera updates from overwriting imported images
-        
+
         self.create_widgets()
         self.setup_model()
-        
+
         self.cap = None
         self.frame = None
         self.ret = False
@@ -140,7 +125,7 @@ class GlaucomaApplication(tk.Tk):
 
         # Initialize UI mode after all variables are set
         self.switch_mode()
-        
+
         self.update_frames_thread = threading.Thread(target=self.update_frames)
         self.update_frames_thread.daemon = True
         self.update_frames_thread.start()
@@ -148,283 +133,224 @@ class GlaucomaApplication(tk.Tk):
     def setup_model(self):
         """Initialize the TensorRT model for glaucoma detection"""
         self.log_to_console("Setting up TensorRT inference engine...")
-        
-        # Define model parameters
-        self.input_size = (416, 416)
+
+        # Define model parameters (same as YOLOv11)
+        self.input_size = (640, 640)  # Standard YOLO input size
         self.conf_threshold = 0.25
         self.iou_threshold = 0.7
-        
+
         # Path to TensorRT engine
         self.engine_path = os.path.join("model_results", "runs", "train", "glaucoma_yolo11", "weights", "best.engine")
-        
+
         # Fallback engine paths
         if not os.path.exists(self.engine_path):
             self.engine_path = os.path.join("model_results", "best.engine")
             if not os.path.exists(self.engine_path):
                 self.engine_path = "best.engine"
-        
+
         try:
             # Load TensorRT engine
             self.trt_inference = TensorRTInference(self.engine_path, input_shape=(1, 3, *self.input_size))
-            
-            # Define class names (adjust based on your model)
-            self.class_names = {0: 'glaucoma', 1: 'normal', 2: 'optic_disc', 3: 'optic_cup'}  # Update based on your classes
+
+            # Define class names (same as the YOLOv11 model)
+            self.class_names = {0: 'glaucoma', 1: 'normal', 2: 'optic_disc', 3: 'optic_cup'}
             self.colors = [[np.random.randint(0, 255) for _ in range(3)] for _ in range(len(self.class_names))]
-            
+
             self.log_to_console(f"TensorRT engine loaded successfully from: {self.engine_path}")
             self.log_to_console(f"Classes: {list(self.class_names.values())}")
             self.log_to_console(f"Input size: {self.input_size}")
-            
+
         except Exception as e:
             self.log_to_console(f"TensorRT engine loading failed: {e}")
             self.log_to_console("Please ensure you have converted the ONNX model to TensorRT format")
             self.trt_inference = None
 
     def preprocess_image(self, image):
-        """Preprocess image for YOLO inference"""
-        # Resize and pad image
+        """Preprocess image for YOLO inference (mimicking YOLOv11 preprocessing)"""
+        # Get image dimensions
         h, w = image.shape[:2]
+
+        # Calculate scale to fit image within input_size while maintaining aspect ratio
         scale = min(self.input_size[0] / w, self.input_size[1] / h)
+
+        # Calculate new dimensions
         new_w, new_h = int(w * scale), int(h * scale)
-        
+
         # Resize image
         resized = cv2.resize(image, (new_w, new_h))
-        
-        # Create padded image
+
+        # Create padded image (letterbox)
         padded = np.full((self.input_size[1], self.input_size[0], 3), 114, dtype=np.uint8)
-        
+
         # Calculate padding offsets to center the image
         dx = (self.input_size[0] - new_w) // 2
         dy = (self.input_size[1] - new_h) // 2
-        
+
         # Place resized image in center
         padded[dy:dy+new_h, dx:dx+new_w] = resized
-        
-        # Convert to float and normalize
+
+        # Convert to float and normalize (0-1 range)
         padded = padded.astype(np.float32) / 255.0
-        
-        # Convert HWC to CHW
+
+        # Convert HWC to CHW (PyTorch format)
         padded = padded.transpose(2, 0, 1)
-        
+
         # Add batch dimension
         padded = np.expand_dims(padded, axis=0)
-        
+
         # Log preprocessing details for debugging
         if not hasattr(self, '_preprocess_logged'):
             self.log_to_console(f"Preprocessing: {w}x{h} → {new_w}x{new_h} → {self.input_size[0]}x{self.input_size[1]}")
             self.log_to_console(f"Scale: {scale:.3f}, Padding: dx={dx}, dy={dy}")
             self._preprocess_logged = True
-        
+
         return padded, scale, dx, dy
 
     def postprocess_detections(self, outputs, scale, dx, dy, orig_shape):
-        """Post-process TensorRT outputs to get bounding boxes"""
+        """Post-process TensorRT outputs to match YOLOv11 format"""
         detections = []
 
-        # Debug: Print output info (only first time)
+        # Debug: Print output shape (only first time)
         if not hasattr(self, '_output_shape_logged'):
-            if isinstance(outputs, dict):
-                self.log_to_console(f"TensorRT outputs: {list(outputs.keys())}")
-                for name, arr in outputs.items():
-                    self.log_to_console(f"  {name}: shape={arr.shape}, dtype={arr.dtype}")
-            else:
-                self.log_to_console(f"TensorRT output shape: {outputs.shape}, size: {outputs.size}")
+            self.log_to_console(f"TensorRT output shape: {outputs.shape}, size: {outputs.size}")
             self._output_shape_logged = True
 
-        # Handle EfficientNMS (4 outputs: num_dets, boxes, scores, classes)
-        if isinstance(outputs, dict):
-            keys = list(outputs.keys())
-            def pick(name_opts):
-                for k in name_opts:
-                    if k in keys:
-                        return outputs[k]
-                return None
+        try:
+            # Reshape output to [batch, num_boxes, num_classes + 5]
+            # Typical YOLO output: [1, 25200, 9] for 4 classes + 5 (bbox + conf)
+            batch_size, num_boxes, num_features = outputs.shape
 
-            num_dets = pick(["num_dets", "nmsed_num", "num_detections"])
-            boxes = pick(["det_boxes", "boxes", "nmsed_boxes"])
-            scores = pick(["det_scores", "scores", "nmsed_scores"])
-            classes = pick(["det_classes", "classes", "nmsed_classes"])
+            self.log_to_console(f"Processing {num_boxes} boxes with {num_features} features each")
 
-            if boxes is not None and scores is not None and classes is not None:
-                try:
-                    n = int(num_dets[0]) if num_dets is not None else min(100, boxes.shape[1])
-                    self.log_to_console(f"EfficientNMS: Processing {n} detections")
+            oh, ow = orig_shape[:2]
 
-                    boxes_slice = boxes[0, :n]     # (n, 4) xyxy on input scale
-                    scores_slice = scores[0, :n]   # (n,) confidence scores
-                    classes_slice = classes[0, :n].astype(int)  # (n,) class IDs
+            for i in range(num_boxes):
+                # Extract box coordinates (cx, cy, w, h) - normalized to [0, 1]
+                cx = float(outputs[0, i, 0])
+                cy = float(outputs[0, i, 1])
+                w = float(outputs[0, i, 2])
+                h = float(outputs[0, i, 3])
 
-                    oh, ow = orig_shape[:2]
-                    for i in range(n):
-                        conf = float(scores_slice[i])
-                        if conf < self.conf_threshold:
-                            continue
+                # Extract object confidence
+                obj_conf = float(outputs[0, i, 4])
 
-                        x1, y1, x2, y2 = boxes_slice[i]
-                        cid = int(classes_slice[i])
+                # Extract class probabilities (indices 5 to end)
+                class_probs = outputs[0, i, 5:num_features]
 
-                        # Undo letterbox: subtract padding, then divide by scale
-                        x1 = int((x1 - dx) / scale)
-                        y1 = int((y1 - dy) / scale)
-                        x2 = int((x2 - dx) / scale)
-                        y2 = int((y2 - dy) / scale)
+                # Find best class
+                best_class_id = int(np.argmax(class_probs))
+                best_class_prob = float(class_probs[best_class_id])
 
-                        # Clip to image bounds
-                        x1 = max(0, min(x1, ow))
-                        y1 = max(0, min(y1, oh))
-                        x2 = max(0, min(x2, ow))
-                        y2 = max(0, min(y2, oh))
+                # Calculate final confidence
+                confidence = obj_conf * best_class_prob
 
-                        if x2 > x1 and y2 > y1:
-                            detections.append({
-                                "bbox": [x1, y1, x2, y2],
-                                "confidence": conf,
-                                "class_id": cid,
-                                "class_name": self.class_names.get(cid, f"class_{cid}")
-                            })
+                # Skip low confidence detections
+                if confidence < self.conf_threshold:
+                    continue
 
-                    self.log_to_console(f"Found {len(detections)} valid detections after EfficientNMS processing")
-                    return detections  # Return directly, NMS already done
+                # Convert normalized coordinates to input image coordinates
+                cx *= self.input_size[0]
+                cy *= self.input_size[1]
+                w *= self.input_size[0]
+                h *= self.input_size[1]
 
-                except Exception as e:
-                    self.log_to_console(f"Error processing EfficientNMS outputs: {e}")
-                    # Fall through to legacy processing
+                # Convert center format to corner format
+                x1 = cx - w / 2
+                y1 = cy - h / 2
+                x2 = cx + w / 2
+                y2 = cy + h / 2
 
-        # Handle single-tensor output format (YOLO-style output)
-        if not isinstance(outputs, dict):
-            try:
-                self.log_to_console(f"Processing single tensor output with shape: {outputs.shape}")
+                # Remove letterbox padding
+                x1 = x1 - dx
+                y1 = y1 - dy
+                x2 = x2 - dx
+                y2 = y2 - dy
 
-                # YOLO output format: [batch, anchors, (classes + 5)]
-                # Where 5 = x, y, w, h, confidence
-                batch_size, num_anchors, num_features = outputs.shape
+                # Scale back to original image size
+                x1 = x1 / scale
+                y1 = y1 / scale
+                x2 = x2 / scale
+                y2 = y2 / scale
 
-                # Get number of classes from the model
-                num_classes = len(self.class_names)
-                expected_features = num_classes + 5  # 4 classes + 5 bbox/conf features
+                # Convert to integers and clip to image bounds
+                x1 = max(0, min(int(x1), ow))
+                y1 = max(0, min(int(y1), oh))
+                x2 = max(0, min(int(x2), ow))
+                y2 = max(0, min(int(y2), oh))
 
-                self.log_to_console(f"Expected features: {expected_features}, Actual features: {num_features}")
+                # Skip invalid boxes
+                if x2 <= x1 or y2 <= y1:
+                    continue
 
-                # Extract boxes, confidence, and class probabilities
-                boxes_xywh = outputs[0, :, :4]  # x, y, w, h (center format)
-                obj_conf = outputs[0, :, 4:5]  # object confidence
-                class_probs = outputs[0, :, 5:5+num_classes]  # class probabilities
+                detections.append({
+                    "bbox": [x1, y1, x2, y2],
+                    "confidence": confidence,
+                    "class_id": best_class_id,
+                    "class_name": self.class_names.get(best_class_id, f"class_{best_class_id}")
+                })
 
-                oh, ow = orig_shape[:2]
-                valid_count = 0
+            self.log_to_console(f"Found {len(detections)} valid detections after processing")
 
-                for i in range(num_anchors):
-                    # Get the best class and its confidence
-                    class_confidences = class_probs[i] * obj_conf[i, 0]
-                    best_class_id = int(np.argmax(class_confidences))
-                    best_conf = float(class_confidences[best_class_id])
-
-                    if best_conf < self.conf_threshold:
-                        continue
-
-                    # Extract box coordinates (center format -> corner format)
-                    x_center, y_center, width, height = boxes_xywh[i]
-
-                    # YOLO coordinates are typically normalized to [0, 1] relative to input size
-                    # Scale to input size first
-                    x_center *= self.input_size[0]
-                    y_center *= self.input_size[1]
-                    width *= self.input_size[0]
-                    height *= self.input_size[1]
-
-                    # Convert center format to corner format
-                    x1 = x_center - width / 2
-                    y1 = y_center - height / 2
-                    x2 = x_center + width / 2
-                    y2 = y_center + height / 2
-
-                    # Undo letterbox: subtract padding, then divide by scale
-                    x1 = (x1 - dx) / scale
-                    y1 = (y1 - dy) / scale
-                    x2 = (x2 - dx) / scale
-                    y2 = (y2 - dy) / scale
-
-                    # Convert to integers and clip to image bounds
-                    x1 = max(0, min(int(x1), ow))
-                    y1 = max(0, min(int(y1), oh))
-                    x2 = max(0, min(int(x2), ow))
-                    y2 = max(0, min(int(y2), oh))
-
-                    if x2 > x1 and y2 > y1:
-                        detections.append({
-                            "bbox": [x1, y1, x2, y2],
-                            "confidence": best_conf,
-                            "class_id": best_class_id,
-                            "class_name": self.class_names.get(best_class_id, f"class_{best_class_id}")
-                        })
-                        valid_count += 1
-
-                self.log_to_console(f"Found {valid_count} valid detections from single tensor processing")
-
-                # Apply NMS since the model doesn't have built-in NMS
-                if detections:
-                    detections = self.apply_nms(detections)
-                    self.log_to_console(f"After NMS: {len(detections)} detections")
-
-                return detections
-
-            except Exception as e:
-                self.log_to_console(f"Error processing single tensor output: {e}")
-                import traceback
-                self.log_to_console(f"Traceback: {traceback.format_exc()}")
+        except Exception as e:
+            self.log_to_console(f"Error in post-processing: {e}")
+            import traceback
+            self.log_to_console(f"Traceback: {traceback.format_exc()}")
 
         return detections
 
     def apply_nms(self, detections):
-        """Apply Non-Maximum Suppression"""
+        """Apply Non-Maximum Suppression to remove overlapping boxes"""
         if not detections:
             return []
-        
-        # Sort by confidence
+
+        # Sort by confidence (highest first)
         detections = sorted(detections, key=lambda x: x['confidence'], reverse=True)
-        
+
         keep = []
         while detections:
             # Take the detection with highest confidence
             current = detections.pop(0)
             keep.append(current)
-            
-            # Remove detections with high IoU
-            detections = [det for det in detections if self.calculate_iou(current['bbox'], det['bbox']) < self.iou_threshold]
-        
+
+            # Calculate IoU with remaining detections and remove overlapping ones
+            detections = [
+                det for det in detections
+                if self.calculate_iou(current['bbox'], det['bbox']) < self.iou_threshold
+            ]
+
         return keep
 
     def calculate_iou(self, box1, box2):
-        """Calculate Intersection over Union"""
+        """Calculate Intersection over Union between two boxes"""
         x1, y1, x2, y2 = box1
         x1_2, y1_2, x2_2, y2_2 = box2
-        
+
         # Calculate intersection area
         xi1 = max(x1, x1_2)
         yi1 = max(y1, y1_2)
         xi2 = min(x2, x2_2)
         yi2 = min(y2, y2_2)
-        
+
         if xi2 <= xi1 or yi2 <= yi1:
             return 0
-        
+
         intersection = (xi2 - xi1) * (yi2 - yi1)
-        
+
         # Calculate union area
         area1 = (x2 - x1) * (y2 - y1)
         area2 = (x2_2 - x1_2) * (y2_2 - y1_2)
         union = area1 + area2 - intersection
-        
+
         return intersection / union if union > 0 else 0
 
     def create_widgets(self):
         """Create the main GUI layout"""
         # Header with logos and title
         self.create_header()
-        
+
         # Main content area with three columns
         self.create_main_content()
-        
+
         # Console log at bottom
         self.create_console()
 
@@ -432,9 +358,9 @@ class GlaucomaApplication(tk.Tk):
         """Create header with logos and title"""
         header_frame = tk.Frame(self)
         header_frame.grid(row=0, column=0, columnspan=3, padx=10, pady=10, sticky="ew")
-        
+
         # Title
-        title_label = tk.Label(header_frame, text="Glaucoma Detection System - TensorRT", 
+        title_label = tk.Label(header_frame, text="Glaucoma Detection System - TensorRT",
                               font=("Helvetica", 24, "bold"))
         title_label.pack(pady=10)
 
@@ -442,10 +368,10 @@ class GlaucomaApplication(tk.Tk):
         """Create the main content area with three columns"""
         # Left column - Patient Information
         self.create_patient_form()
-        
+
         # Middle column - Camera and controls
         self.create_camera_section()
-        
+
         # Right column - Doctor Information and Results
         self.create_doctor_results_section()
 
@@ -469,7 +395,7 @@ class GlaucomaApplication(tk.Tk):
 
         tk.Label(patient_frame, text="Gender:").grid(row=3, column=0, sticky="w", pady=5)
         self.patient_gender_var = tk.StringVar()
-        gender_combo = ttk.Combobox(patient_frame, textvariable=self.patient_gender_var, 
+        gender_combo = ttk.Combobox(patient_frame, textvariable=self.patient_gender_var,
                                    values=["Male", "Female", "Other"], width=17, state="readonly")
         gender_combo.grid(row=3, column=1, pady=5)
 
@@ -493,9 +419,9 @@ class GlaucomaApplication(tk.Tk):
         # Mode selection
         mode_frame = tk.Frame(camera_frame)
         mode_frame.grid(row=0, column=0, pady=5)
-        
+
         tk.Label(mode_frame, text="Detection Mode:", font=("Helvetica", 10, "bold")).grid(row=0, column=0, padx=5)
-        
+
         self.mode_var = tk.StringVar(value="camera")
         tk.Radiobutton(mode_frame, text="Camera Stream", variable=self.mode_var, value="camera",
                       command=self.switch_mode).grid(row=0, column=1, padx=5)
@@ -505,7 +431,7 @@ class GlaucomaApplication(tk.Tk):
         # Camera display
         self.camera_label = tk.Label(camera_frame, text="Camera Stream")
         self.camera_label.grid(row=1, column=0, pady=10)
-        
+
         self.camera_frame_widget = tk.Label(camera_frame)
         self.camera_frame_widget.grid(row=2, column=0, pady=10)
 
@@ -516,7 +442,7 @@ class GlaucomaApplication(tk.Tk):
         # Camera controls (row 0)
         self.camera_controls_frame = tk.Frame(control_frame)
         self.camera_controls_frame.grid(row=0, column=0, columnspan=3, pady=5)
-        
+
         tk.Label(self.camera_controls_frame, text="Select Camera:").grid(row=0, column=0, padx=5, pady=5)
         self.camera_var = tk.StringVar(value="None")
         self.camera_dropdown = ttk.Combobox(self.camera_controls_frame, textvariable=self.camera_var, width=15)
@@ -531,20 +457,20 @@ class GlaucomaApplication(tk.Tk):
         # Image import controls (row 1)
         self.image_controls_frame = tk.Frame(control_frame)
         self.image_controls_frame.grid(row=1, column=0, columnspan=3, pady=5)
-        
+
         tk.Button(self.image_controls_frame, text="Import Image", command=self.import_image,
                  bg="#ffcc99").grid(row=0, column=0, padx=5, pady=5)
-        
-        self.image_path_label = tk.Label(self.image_controls_frame, text="No image selected", 
+
+        self.image_path_label = tk.Label(self.image_controls_frame, text="No image selected",
                                         wraplength=300, justify="left")
         self.image_path_label.grid(row=0, column=1, padx=5, pady=5)
 
         # Detection controls (row 2)
-        self.start_button = tk.Button(control_frame, text="Start Live Detection", 
+        self.start_button = tk.Button(control_frame, text="Start Live Detection",
                                      command=self.toggle_detection, bg="#ccffcc")
         self.start_button.grid(row=2, column=0, padx=5, pady=5)
 
-        self.capture_button = tk.Button(control_frame, text="Analyze Current", 
+        self.capture_button = tk.Button(control_frame, text="Analyze Current",
                                        command=self.capture_and_analyze, bg="#ccccff")
         self.capture_button.grid(row=2, column=1, padx=5, pady=5)
 
@@ -568,7 +494,7 @@ class GlaucomaApplication(tk.Tk):
         tk.Label(doctor_frame, text="Specialization:").grid(row=2, column=0, sticky="w", pady=5)
         self.doctor_spec_var = tk.StringVar()
         spec_combo = ttk.Combobox(doctor_frame, textvariable=self.doctor_spec_var,
-                                 values=["Ophthalmologist", "General Practitioner", "Specialist"], 
+                                 values=["Ophthalmologist", "General Practitioner", "Specialist"],
                                  width=17, state="readonly")
         spec_combo.grid(row=2, column=1, pady=5)
 
@@ -580,7 +506,7 @@ class GlaucomaApplication(tk.Tk):
         results_frame = tk.LabelFrame(doctor_frame, text="Detection Results")
         results_frame.grid(row=4, column=0, columnspan=2, pady=10, sticky="ew")
 
-        self.result_label = tk.Label(results_frame, text="No analysis performed yet", 
+        self.result_label = tk.Label(results_frame, text="No analysis performed yet",
                                     font=("Helvetica", 10), wraplength=200)
         self.result_label.pack(pady=10)
 
@@ -610,7 +536,7 @@ class GlaucomaApplication(tk.Tk):
             if cap.isOpened():
                 available_cameras.append(str(idx))
             cap.release()
-        
+
         self.camera_dropdown['values'] = ["None"] + available_cameras
         if available_cameras:
             self.camera_dropdown.current(1)  # Select first available camera
@@ -618,7 +544,7 @@ class GlaucomaApplication(tk.Tk):
     def switch_mode(self):
         """Switch between camera and image modes"""
         self.detection_mode = self.mode_var.get()
-        
+
         if self.detection_mode == "camera":
             # Show camera controls, hide image controls
             self.camera_controls_frame.grid()
@@ -626,14 +552,14 @@ class GlaucomaApplication(tk.Tk):
             self.camera_label.config(text="Camera Stream")
             self.start_button.config(text="Start Live Detection", state="normal", bg="#ccffcc")
             self.capture_button.config(text="Capture & Analyze")
-            
+
             # Unlock display for camera updates
             self.display_locked = False
-            
+
             # Stop live detection if running
             if self.processing_started:
                 self.processing_started = False  # Reset without calling toggle_detection to avoid recursion
-                
+
         else:  # image mode
             # Hide camera controls, show image controls
             self.camera_controls_frame.grid_remove()
@@ -641,20 +567,20 @@ class GlaucomaApplication(tk.Tk):
             self.camera_label.config(text="Imported Image")
             self.start_button.config(text="Live Detection (N/A)", state="disabled", bg="#cccccc")
             self.capture_button.config(text="Analyze Image")
-            
+
             # Stop live detection and release camera
             if self.processing_started:
                 self.processing_started = False  # Reset without calling toggle_detection
             if self.cap is not None:
                 self.cap.release()
                 self.cap = None
-                
+
             # Keep display locked if image is imported, otherwise show placeholder
             if self.imported_image is None:
                 self.display_locked = False
                 # Show placeholder for image mode
                 self.show_image_placeholder()
-                
+
         self.log_to_console(f"Switched to {self.detection_mode} mode")
 
     def show_image_placeholder(self):
@@ -663,20 +589,20 @@ class GlaucomaApplication(tk.Tk):
             # Create placeholder image
             placeholder = np.zeros((375, 500, 3), dtype=np.uint8)
             placeholder.fill(50)  # Dark gray background
-            
+
             # Add text
-            cv2.putText(placeholder, "No Image Imported", (140, 180), 
+            cv2.putText(placeholder, "No Image Imported", (140, 180),
                        cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-            cv2.putText(placeholder, "Click 'Import Image' to select a file", (90, 220), 
+            cv2.putText(placeholder, "Click 'Import Image' to select a file", (90, 220),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
-            
+
             # Convert to PhotoImage and display
             img = Image.fromarray(placeholder)
             imgtk = ImageTk.PhotoImage(image=img)
-            
+
             self.camera_frame_widget.config(image=imgtk)
             self.camera_frame_widget.image = imgtk
-            
+
         except Exception as e:
             self.log_to_console(f"Error showing placeholder: {e}")
 
@@ -688,34 +614,34 @@ class GlaucomaApplication(tk.Tk):
             ('PNG files', '*.png'),
             ('All files', '*.*')
         ]
-        
+
         file_path = filedialog.askopenfilename(
             title="Select Eye Image for Glaucoma Detection",
             filetypes=file_types,
             initialdir=os.getcwd()
         )
-        
+
         if file_path:
             try:
                 # Load and validate image
                 self.imported_image = cv2.imread(file_path)
                 if self.imported_image is None:
                     raise ValueError("Could not load image file")
-                
+
                 self.imported_image_path = file_path
-                
+
                 # Update UI
                 filename = os.path.basename(file_path)
                 self.image_path_label.config(text=f"Selected: {filename}")
-                
+
                 # Display the imported image
                 self.display_imported_image()
-                
+
                 # Lock display to prevent camera updates from overwriting
                 self.display_locked = True
-                
+
                 self.log_to_console(f"Image imported successfully: {filename}")
-                
+
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to import image: {e}")
                 self.log_to_console(f"Error importing image: {e}")
@@ -727,7 +653,7 @@ class GlaucomaApplication(tk.Tk):
                 # Convert and resize for display
                 display_image = cv2.cvtColor(self.imported_image, cv2.COLOR_BGR2RGB)
                 height, width = display_image.shape[:2]
-                
+
                 # Calculate resize dimensions maintaining aspect ratio
                 max_width, max_height = 500, 375
                 if width > max_width or height > max_height:
@@ -735,24 +661,24 @@ class GlaucomaApplication(tk.Tk):
                     new_width = int(width * scale)
                     new_height = int(height * scale)
                     display_image = cv2.resize(display_image, (new_width, new_height))
-                
+
                 # Convert to PhotoImage and display
                 img = Image.fromarray(display_image)
                 imgtk = ImageTk.PhotoImage(image=img)
-                
+
                 self.camera_frame_widget.config(image=imgtk)
                 self.camera_frame_widget.image = imgtk
-                
+
             except Exception as e:
                 self.log_to_console(f"Error displaying imported image: {e}")
 
     def apply_selected_camera(self):
         """Apply the selected camera"""
         camera_id = self.camera_var.get()
-        
+
         if self.cap is not None:
             self.cap.release()
-            
+
         if camera_id != "None" and camera_id.isdigit():
             self.cap = cv2.VideoCapture(int(camera_id))
             if self.cap.isOpened():
@@ -783,7 +709,7 @@ class GlaucomaApplication(tk.Tk):
         """Capture current frame or analyze imported image"""
         if not self.validate_forms():
             return
-            
+
         # Get the image to analyze based on current mode
         if self.detection_mode == "camera":
             if self.frame is None:
@@ -797,18 +723,18 @@ class GlaucomaApplication(tk.Tk):
                 return
             analysis_image = self.imported_image.copy()
             source_info = f"imported image: {os.path.basename(self.imported_image_path)}"
-            
+
         self.log_to_console(f"Performing glaucoma analysis on {source_info}...")
-        
+
         # Process the image
         analysis_result = self.analyze_for_glaucoma(analysis_image)
-        
+
         # Save the result image and the original image
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         result_filename = f"glaucoma_result_{timestamp}.jpg"
         result_path = os.path.join("results", result_filename)
         os.makedirs("results", exist_ok=True)
-        
+
         cv2.imwrite(result_path, analysis_result['annotated_image'])
         original_filename = f"glaucoma_original_{timestamp}.jpg"
         original_path = os.path.join("results", original_filename)
@@ -817,19 +743,19 @@ class GlaucomaApplication(tk.Tk):
             self.original_image_path = original_path
         except Exception:
             self.original_image_path = self.imported_image_path if self.detection_mode == "image" else None
-        
+
         # Update results
         self.detection_result = analysis_result
         self.result_image = result_path
-        
+
         # Update UI
         self.update_result_display(analysis_result)
-        
+
         # If in image mode, also display the result
         if self.detection_mode == "image":
             self.display_analysis_result(analysis_result['annotated_image'])
             self.display_locked = True  # Keep the analysis result displayed
-        
+
         self.log_to_console(f"Analysis completed. Result saved: {result_path}")
 
     def display_analysis_result(self, annotated_image):
@@ -838,7 +764,7 @@ class GlaucomaApplication(tk.Tk):
             # Convert and resize for display
             display_image = cv2.cvtColor(annotated_image, cv2.COLOR_BGR2RGB)
             height, width = display_image.shape[:2]
-            
+
             # Calculate resize dimensions maintaining aspect ratio
             max_width, max_height = 500, 375
             if width > max_width or height > max_height:
@@ -846,149 +772,101 @@ class GlaucomaApplication(tk.Tk):
                 new_width = int(width * scale)
                 new_height = int(height * scale)
                 display_image = cv2.resize(display_image, (new_width, new_height))
-            
+
             # Convert to PhotoImage and display
             img = Image.fromarray(display_image)
             imgtk = ImageTk.PhotoImage(image=img)
-            
+
             self.camera_frame_widget.config(image=imgtk)
             self.camera_frame_widget.image = imgtk
-            
+
         except Exception as e:
             self.log_to_console(f"Error displaying analysis result: {e}")
 
     def analyze_for_glaucoma(self, frame):
-        """Analyze frame for glaucoma detection using TensorRT"""
+        """Analyze frame for glaucoma detection using TensorRT (mimicking YOLOv11)"""
         result = {
             'has_glaucoma': False,
             'confidence': 0.0,
             'detected_features': [],
             'annotated_image': frame.copy()
         }
-        
+
         if self.trt_inference is None:
             self.log_to_console("TensorRT inference engine not available")
             return result
-        
+
         try:
-            # Preprocess image
+            # Preprocess image (same as YOLOv11 preprocessing)
             preprocessed, scale, dx, dy = self.preprocess_image(frame)
-            
-            # Run TensorRT inference
+
+            # Run TensorRT inference (equivalent to YOLOv11's model(frame))
             start_time = time.time()
-            outputs = self.trt_inference.infer(preprocessed)
+            raw_outputs = self.trt_inference.infer(preprocessed)
             inference_time = time.time() - start_time
-            
-            # Post-process detections
-            detections = self.postprocess_detections(outputs, scale, dx, dy, frame.shape)
-            
-            # Process detections
+
+            self.log_to_console(f"TensorRT inference completed in {inference_time:.3f}s")
+
+            # Reshape output to proper format
+            # Assuming output shape is [1, num_boxes, num_features]
+            output_tensor = raw_outputs.reshape(1, -1, raw_outputs.shape[-1])
+
+            # Post-process detections (equivalent to YOLOv11's results processing)
+            detections = self.postprocess_detections(output_tensor, scale, dx, dy, frame.shape)
+
+            # Apply NMS (like YOLOv11 does internally)
+            detections = self.apply_nms(detections)
+
+            # Process detections (same logic as working YOLOv11 version)
             annotated_frame = frame.copy()
-            
+
             for detection in detections:
                 x1, y1, x2, y2 = detection['bbox']
                 confidence = detection['confidence']
                 class_name = detection['class_name']
                 class_id = detection['class_id']
-                
-                # Determine if glaucoma indicators are present
-                if ('glaucoma' in class_name.lower() or 
-                    'optic' in class_name.lower() or 
-                    'disc' in class_name.lower() or 
+
+                # Determine if glaucoma indicators are present (same logic as YOLOv11 version)
+                if ('glaucoma' in class_name.lower() or
+                    'optic' in class_name.lower() or
+                    'disc' in class_name.lower() or
                     'cup' in class_name.lower() or
                     confidence > 0.6):
                     result['has_glaucoma'] = True
                     result['confidence'] = max(result['confidence'], confidence)
-                
+
                 result['detected_features'].append({
                     'class': class_name,
                     'confidence': confidence,
                     'bbox': [x1, y1, x2, y2]
                 })
-                
-                # Draw bounding box
+
+                # Draw bounding box (same as YOLOv11 version)
                 color = self.colors[class_id % len(self.colors)]
                 label = f"{class_name} ({confidence:.2f})"
-                
+
                 # Draw rectangle and label
                 cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
-                
+
                 # Label background
                 label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
-                cv2.rectangle(annotated_frame, (x1, y1 - label_size[1] - 10), 
+                cv2.rectangle(annotated_frame, (x1, y1 - label_size[1] - 10),
                             (x1 + label_size[0], y1), color, -1)
-                
+
                 # Label text
-                cv2.putText(annotated_frame, label, (x1, y1 - 5), 
+                cv2.putText(annotated_frame, label, (x1, y1 - 5),
                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-            
+
             result['annotated_image'] = annotated_frame
-            self.log_to_console(f"TensorRT inference time: {inference_time:.3f}s")
-            
+
+            self.log_to_console(f"Analysis completed: {len(detections)} detections found")
+
         except Exception as e:
             self.log_to_console(f"Error in TensorRT glaucoma analysis: {e}")
-        
+            import traceback
+            self.log_to_console(f"Traceback: {traceback.format_exc()}")
+
         return result
-
-    def run_live_detection(self, frame):
-        """Run live detection on frame using TensorRT"""
-        if self.trt_inference is None:
-            return
-            
-        try:
-            # Clear previous detections
-            self.boxes.clear()
-            self.confs.clear()
-            self.clss.clear()
-
-            # Preprocess image
-            preprocessed, scale, dx, dy = self.preprocess_image(frame)
-            
-            # Run TensorRT inference
-            start_time = time.time()
-            outputs = self.trt_inference.infer(preprocessed)
-            fps = 1 / (time.time() - start_time)
-            self.total_fps.append(fps)
-
-            # Post-process detections
-            detections = self.postprocess_detections(outputs, scale, dx, dy, frame.shape)
-
-            # Process detections for live display
-            for detection in detections:
-                x1, y1, x2, y2 = detection['bbox']
-                confidence = detection['confidence']
-                class_id = detection['class_id']
-                
-                self.confs.append(confidence)
-                self.clss.append(class_id)
-                self.boxes.append((x1, y1, x2, y2))
-
-            # Draw detections on frame
-            for box, cls_id, score in zip(self.boxes, self.clss, self.confs):
-                x1, y1, x2, y2 = box
-                class_name = self.class_names.get(cls_id, f'class_{cls_id}')
-                label = f"{class_name} ({score:.2f})"
-                color = self.colors[cls_id % len(self.colors)]
-                
-                # Draw rectangle and label
-                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                
-                # Label background
-                label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
-                cv2.rectangle(frame, (x1, y1 - label_size[1] - 10), 
-                            (x1 + label_size[0], y1), color, -1)
-                
-                # Label text
-                cv2.putText(frame, label, (x1, y1 - 5), 
-                          cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-
-            # Display FPS
-            if self.total_fps:
-                cv2.putText(frame, f"FPS: {fps:.1f}", (10, 30), 
-                          cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-
-        except Exception as e:
-            self.log_to_console(f"Error in live TensorRT detection: {e}")
 
     def update_result_display(self, analysis_result):
         """Update the result display with analysis results"""
@@ -1007,12 +885,12 @@ class GlaucomaApplication(tk.Tk):
         if not self.patient_id_var.get() or not self.patient_name_var.get():
             messagebox.showerror("Error", "Please fill in Patient ID and Name")
             return False
-        
+
         # Check doctor info
         if not self.doctor_id_var.get() or not self.doctor_name_var.get():
             messagebox.showerror("Error", "Please fill in Doctor ID and Name")
             return False
-        
+
         return True
 
     def collect_patient_info(self):
@@ -1042,7 +920,7 @@ class GlaucomaApplication(tk.Tk):
         if self.detection_result is None:
             messagebox.showerror("Error", "No analysis results to send")
             return
-        
+
         try:
             if not self.result_image:
                 messagebox.showerror("Error", "No result image found")
@@ -1062,15 +940,15 @@ class GlaucomaApplication(tk.Tk):
             self.log_to_console("Uploading original image...")
             self.log_to_console(f"Upload URL: {self.server_upload_url}")
             self.log_to_console(f"Original image path: {self.original_image_path}")
-            
+
             with open(self.original_image_path, 'rb') as f:
                 files = {'image': (os.path.basename(self.original_image_path), f, 'image/jpeg')}
                 r1 = requests.post(self.server_upload_url, files=files, headers=headers, timeout=30)
-            
+
             self.log_to_console(f"Upload response status: {r1.status_code}")
             self.log_to_console(f"Upload response text: {r1.text}")
             r1.raise_for_status()
-            
+
             response_json = r1.json()
             original_url = response_json.get('url')
             if not original_url:
@@ -1078,19 +956,19 @@ class GlaucomaApplication(tk.Tk):
 
             self.log_to_console(f"Original image uploaded: {original_url}")
             self.log_to_console("Uploading detected image...")
-            
+
             with open(self.result_image, 'rb') as f:
                 files = {'image': (os.path.basename(self.result_image), f, 'image/jpeg')}
                 r2 = requests.post(self.server_upload_url, files=files, headers=headers, timeout=30)
-            
+
             self.log_to_console(f"Detected upload response status: {r2.status_code}")
             r2.raise_for_status()
-            
+
             response_json = r2.json()
             detected_url = response_json.get('url')
             if not detected_url:
                 raise ValueError(f"No URL in detected upload response: {response_json}")
-            
+
             self.log_to_console(f"Detected image uploaded: {detected_url}")
 
             patient = self.collect_patient_info()
@@ -1118,7 +996,7 @@ class GlaucomaApplication(tk.Tk):
 
             self.log_to_console("Record created successfully")
             messagebox.showinfo("Success", "Sent to server successfully")
-            
+
         except Exception as e:
             self.log_to_console(f"Error sending to server: {e}")
             messagebox.showerror("Error", f"Failed to send data: {e}")
@@ -1153,7 +1031,7 @@ class GlaucomaApplication(tk.Tk):
                     # Create blank frame if no camera
                     if not self.ret or self.frame is None:
                         self.frame = np.zeros((480, 640, 3), dtype=np.uint8)
-                        cv2.putText(self.frame, "No Camera Connected", (180, 240), 
+                        cv2.putText(self.frame, "No Camera Connected", (180, 240),
                                   cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
 
                     display_frame = self.frame.copy()
@@ -1165,12 +1043,71 @@ class GlaucomaApplication(tk.Tk):
                     # Update camera display only in camera mode and when not locked
                     if not self.display_locked:
                         self.update_camera_display(display_frame)
-                
+
                 # In image mode, don't update the display (keep imported image)
                 time.sleep(0.03)  # ~30 FPS
-                
+
             except Exception as e:
                 self.log_to_console(f"Error in update_frames: {e}")
+
+    def run_live_detection(self, frame):
+        """Run live detection on frame using TensorRT (mimicking YOLOv11)"""
+        try:
+            # Clear previous detections
+            self.boxes.clear()
+            self.confs.clear()
+            self.clss.clear()
+
+            # Preprocess image (same as YOLOv11)
+            preprocessed, scale, dx, dy = self.preprocess_image(frame)
+
+            # Run TensorRT inference
+            start_time = time.time()
+            raw_outputs = self.trt_inference.infer(preprocessed)
+            fps = 1 / (time.time() - start_time)
+            self.total_fps.append(fps)
+
+            # Reshape and post-process
+            output_tensor = raw_outputs.reshape(1, -1, raw_outputs.shape[-1])
+            detections = self.postprocess_detections(output_tensor, scale, dx, dy, frame.shape)
+            detections = self.apply_nms(detections)
+
+            # Store detections for display
+            for detection in detections:
+                x1, y1, x2, y2 = detection['bbox']
+                confidence = detection['confidence']
+                class_id = detection['class_id']
+
+                self.confs.append(confidence)
+                self.clss.append(class_id)
+                self.boxes.append((x1, y1, x2, y2))
+
+            # Draw detections on frame (same as YOLOv11)
+            for box, cls_id, score in zip(self.boxes, self.clss, self.confs):
+                x1, y1, x2, y2 = box
+                class_name = self.class_names[cls_id]
+                label = f"{class_name} ({score:.2f})"
+                color = self.colors[cls_id % len(self.colors)]
+
+                # Draw rectangle and label
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+
+                # Label background
+                label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
+                cv2.rectangle(frame, (x1, y1 - label_size[1] - 10),
+                            (x1 + label_size[0], y1), color, -1)
+
+                # Label text
+                cv2.putText(frame, label, (x1, y1 - 5),
+                          cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+            # Display FPS
+            if self.total_fps:
+                cv2.putText(frame, f"FPS: {fps:.1f}", (10, 30),
+                          cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+        except Exception as e:
+            self.log_to_console(f"Error in live TensorRT detection: {e}")
 
     def update_camera_display(self, frame):
         """Update camera display widget"""
@@ -1178,15 +1115,15 @@ class GlaucomaApplication(tk.Tk):
             # Convert and resize frame for display
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             frame_resized = cv2.resize(frame_rgb, (500, 375))
-            
+
             # Convert to PhotoImage
             img = Image.fromarray(frame_resized)
             imgtk = ImageTk.PhotoImage(image=img)
-            
+
             # Update display
             self.camera_frame_widget.config(image=imgtk)
             self.camera_frame_widget.image = imgtk
-            
+
         except Exception as e:
             self.log_to_console(f"Error updating camera display: {e}")
 
@@ -1194,7 +1131,7 @@ class GlaucomaApplication(tk.Tk):
         """Add message to console log"""
         timestamp = datetime.now().strftime("%H:%M:%S")
         formatted_message = f"[{timestamp}] {message}"
-        
+
         self.console_log.config(state='normal')
         self.console_log.insert(tk.END, formatted_message + "\n")
         self.console_log.config(state='disabled')
