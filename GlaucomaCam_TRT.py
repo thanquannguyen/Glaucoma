@@ -742,4 +742,4 @@ class GlaucomaApplicationTRT(tk.Tk):
 if __name__ == "__main__":
     app = GlaucomaApplicationTRT()
     app.protocol("WM_DELETE_WINDOW", app.on_closing)
-    app.mainloo
+    app.mainloop()
