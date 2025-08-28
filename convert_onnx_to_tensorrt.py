@@ -53,7 +53,7 @@ class ONNXToTensorRTConverter:
         self.precision = precision.lower()
         self.max_batch_size = max_batch_size
         self.max_workspace_size = max_workspace_size
-        self.input_shape = input_shape or (1, 3, 640, 640)
+        self.input_shape = input_shape or (1, 3, 416, 416)
         
         # Validate inputs
         if not os.path.exists(self.onnx_path):
@@ -145,7 +145,9 @@ class ONNXToTensorRTConverter:
         logger.info(f"Saving engine to {self.engine_path}")
         
         # Create directory if it doesn't exist
-        os.makedirs(os.path.dirname(self.engine_path), exist_ok=True)
+        engine_dir = os.path.dirname(self.engine_path)
+        if engine_dir:  # Only create directory if there's a directory component
+            os.makedirs(engine_dir, exist_ok=True)
         
         with open(self.engine_path, 'wb') as f:
             f.write(engine.serialize())
@@ -194,7 +196,7 @@ class ONNXToTensorRTConverter:
             logger.error(f"Conversion failed: {e}")
             return False
 
-def test_engine(engine_path, input_shape=(1, 3, 640, 640)):
+def test_engine(engine_path, input_shape=(1, 3, 416, 416)):
     """Test the converted TensorRT engine"""
     logger.info(f"Testing engine: {engine_path}")
     
@@ -251,8 +253,8 @@ def main():
                        help='Precision mode (default: fp16)')
     parser.add_argument('--batch_size', type=int, default=1, help='Maximum batch size (default: 1)')
     parser.add_argument('--workspace', type=int, default=1024, help='Max workspace size in MB (default: 1024)')
-    parser.add_argument('--input_shape', nargs=4, type=int, default=[1, 3, 640, 640],
-                       help='Input shape as batch channels height width (default: 1 3 640 640)')
+    parser.add_argument('--input_shape', nargs=4, type=int, default=[1, 3, 416, 416],
+                       help='Input shape as batch channels height width (default: 1 3 416 416)')
     parser.add_argument('--test', action='store_true', help='Test the converted engine after conversion')
     parser.add_argument('--verbose', action='store_true', help='Enable verbose logging')
     

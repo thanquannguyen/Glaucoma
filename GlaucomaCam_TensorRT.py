@@ -135,7 +135,7 @@ class GlaucomaApplication(tk.Tk):
         self.log_to_console("Setting up TensorRT inference engine...")
         
         # Define model parameters
-        self.input_size = (640, 640)
+        self.input_size = (416, 416)
         self.conf_threshold = 0.25
         self.iou_threshold = 0.7
         
