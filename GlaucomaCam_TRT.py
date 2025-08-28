@@ -19,441 +19,210 @@ try:
     import tensorrt as trt
     import pycuda.driver as cuda
     import pycuda.autoinit  # noqa: F401
-except Exception:
+except ImportError:
     trt = None
     cuda = None
+    print("Warning: TensorRT or PyCUDA not found. This script will not run.")
 
 
 class TRTDetector:
-    def __init__(self, engine_path, conf_threshold=0.25, iou_threshold=0.7):
+    """
+    A class for performing object detection using a TensorRT engine.
+    Handles model loading, preprocessing, inference, and post-processing.
+    """
+    def __init__(self, engine_path, conf_threshold=0.25, iou_threshold=0.45):
         if trt is None or cuda is None:
-            raise RuntimeError("TensorRT/PyCUDA not available. Install on Jetson Nano.")
+            raise RuntimeError("TensorRT/PyCUDA not available. Please install on your Jetson device.")
 
         if not os.path.exists(engine_path):
-            raise FileNotFoundError(f"Engine not found: {engine_path}")
+            raise FileNotFoundError(f"TensorRT engine not found at: {engine_path}")
 
         self.engine_path = engine_path
         self.conf_threshold = float(conf_threshold)
         self.iou_threshold = float(iou_threshold)
 
+        # Initialize TensorRT logger, runtime, and engine
         self.logger = trt.Logger(trt.Logger.INFO)
-        with open(engine_path, 'rb') as f:
-            engine_data = f.read()
-        runtime = trt.Runtime(self.logger)
-        self.engine = runtime.deserialize_cuda_engine(engine_data)
+        with open(engine_path, 'rb') as f, trt.Runtime(self.logger) as runtime:
+            self.engine = runtime.deserialize_cuda_engine(f.read())
+        
         if self.engine is None:
-            raise RuntimeError("Failed to deserialize TensorRT engine")
+            raise RuntimeError("Failed to deserialize the TensorRT engine.")
 
         self.context = self.engine.create_execution_context()
         if self.context is None:
-            raise RuntimeError("Failed to create TensorRT execution context")
+            raise RuntimeError("Failed to create a TensorRT execution context.")
 
-        # Find bindings
-        self.bindings = [None] * self.engine.num_bindings
-        self.host_buffers = [None] * self.engine.num_bindings
-        self.device_buffers = [None] * self.engine.num_bindings
-        self.binding_names = []
-        self.input_index = None
-        self.output_indices = []
-
-        for i in range(self.engine.num_bindings):
-            name = self.engine.get_binding_name(i)
-            self.binding_names.append(name)
-            if self.engine.binding_is_input(i):
-                self.input_index = i
-            else:
-                self.output_indices.append(i)
-
-        if self.input_index is None:
-            raise RuntimeError("No input binding found in engine")
-
-        # Determine and set input shape (handle dynamic)
-        self.input_shape = self._determine_input_shape()
+        # Allocate memory for inputs and outputs
         self._allocate_buffers()
 
-        # CUDA stream
+        # Create a CUDA stream for asynchronous execution
         self.stream = cuda.Stream()
 
-        # Parsing controls via environment
-        self.force_format = (os.environ.get("GL_TRT_BOX_FORMAT", "auto").strip().lower())  # 'auto'|'xyxy'|'cxcywh'
-        self.force_normalized = (os.environ.get("GL_TRT_BOX_NORMALIZED", "auto").strip().lower())  # 'auto'|'1'|'0'
-        try:
-            self.class_offset = int(os.environ.get("GL_TRT_CLASS_OFFSET", "0").strip())
-        except Exception:
-            self.class_offset = 0
-        self.debug = os.environ.get("GL_TRT_DEBUG", "0").strip() in ("1", "true", "yes")
-
-    def _determine_input_shape(self):
-        shape = self.engine.get_binding_shape(self.input_index)
-        # Static shape
-        if all(dim > 0 for dim in shape):
-            if len(shape) == 4:
-                return tuple(shape)
-            # Some engines use CHW without batch
-            if len(shape) == 3:
-                return (1, shape[0], shape[1], shape[2])
-
-        # Dynamic: try common YOLO sizes
-        candidate_shapes = [
-            (1, 3, 640, 640),
-            (1, 3, 416, 416),
-            (1, 3, 320, 320),
-        ]
-        for cand in candidate_shapes:
-            try:
-                self.context.set_binding_shape(self.input_index, cand)
-                got = tuple(self.context.get_binding_shape(self.input_index))
-                if got == cand:
-                    return cand
-            except Exception:
-                continue
-        # If none worked, raise
-        raise RuntimeError("Could not set a valid input shape for dynamic engine. Try rebuilding with a known size.")
-
     def _allocate_buffers(self):
-        # After input shape set, determine output shapes and allocate buffers
-        for i in range(self.engine.num_bindings):
-            binding_shape = self.context.get_binding_shape(i)
-            if any(dim < 0 for dim in binding_shape):
-                # Some outputs may be dynamic; provide a max-size guess, then we'll resize after run
-                # Use product of known dims with a reasonable max
-                vol = 1
-                for dim in binding_shape:
-                    vol *= (dim if dim > 0 else 8400)
-            else:
-                vol = int(np.prod(binding_shape))
+        """
+        Allocates host and device memory for engine bindings (inputs/outputs).
+        """
+        self.bindings = []
+        self.host_inputs = []
+        self.host_outputs = []
+        self.device_inputs = []
+        self.device_outputs = []
 
-            dtype = trt.nptype(self.engine.get_binding_dtype(i))
-            host_mem = cuda.pagelocked_empty(vol, dtype)
+        for binding in self.engine:
+            size = trt.volume(self.engine.get_binding_shape(binding))
+            dtype = trt.nptype(self.engine.get_binding_dtype(binding))
+            
+            # Allocate host and device memory
+            host_mem = cuda.pagelocked_empty(size, dtype)
             device_mem = cuda.mem_alloc(host_mem.nbytes)
-            self.host_buffers[i] = host_mem
-            self.device_buffers[i] = device_mem
-            self.bindings[i] = int(device_mem)
+            
+            # Append the device buffer address to the bindings list
+            self.bindings.append(int(device_mem))
+
+            if self.engine.binding_is_input(binding):
+                self.input_shape = self.engine.get_binding_shape(binding)
+                self.host_inputs.append(host_mem)
+                self.device_inputs.append(device_mem)
+            else:
+                self.host_outputs.append(host_mem)
+                self.device_outputs.append(device_mem)
 
     def _letterbox(self, image, new_shape=(640, 640), color=(114, 114, 114)):
+        """
+        Resizes and pads an image to a new shape while maintaining the aspect ratio.
+        This is a standard preprocessing step for YOLO models.
+        """
         h, w = image.shape[:2]
         r = min(new_shape[0] / h, new_shape[1] / w)
+        
         new_unpad = (int(round(w * r)), int(round(h * r)))
-        dw = new_shape[1] - new_unpad[0]
-        dh = new_shape[0] - new_unpad[1]
-        dw /= 2
-        dh /= 2
+        dw, dh = (new_shape[1] - new_unpad[0]) / 2, (new_shape[0] - new_unpad[1]) / 2
 
         if (w, h) != new_unpad:
             image = cv2.resize(image, new_unpad, interpolation=cv2.INTER_LINEAR)
 
         top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
         left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
+        
         image = cv2.copyMakeBorder(image, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)
         return image, r, (left, top)
 
-    def _nms(self, boxes, scores, iou_thres):
-        if len(boxes) == 0:
-            return []
-        boxes = np.array(boxes, dtype=np.float32)
-        scores = np.array(scores, dtype=np.float32)
-        x1 = boxes[:, 0]
-        y1 = boxes[:, 1]
-        x2 = boxes[:, 2]
-        y2 = boxes[:, 3]
-        areas = (x2 - x1 + 1) * (y2 - y1 + 1)
-        order = scores.argsort()[::-1]
-        keep = []
-        while order.size > 0:
-            i = order[0]
-            keep.append(i)
-            xx1 = np.maximum(x1[i], x1[order[1:]])
-            yy1 = np.maximum(y1[i], y1[order[1:]])
-            xx2 = np.minimum(x2[i], x2[order[1:]])
-            yy2 = np.minimum(y2[i], y2[order[1:]])
-            w = np.maximum(0.0, xx2 - xx1 + 1)
-            h = np.maximum(0.0, yy2 - yy1 + 1)
-            inter = w * h
-            iou = inter / (areas[i] + areas[order[1:]] - inter + 1e-6)
-            inds = np.where(iou <= iou_thres)[0]
-            order = order[inds + 1]
-        return keep
-
-    def _apply_classwise_nms(self, dets, iou_thres):
-        if not dets:
-            return dets
-        dets = np.array(dets, dtype=np.float32)
-        classes = dets[:, 5].astype(np.int32)
-        keep_all = []
-        for cls_id in np.unique(classes):
-            idxs = np.where(classes == cls_id)[0]
-            boxes = dets[idxs, 0:4]
-            scores = dets[idxs, 4]
-            keep_idx_rel = self._nms(boxes, scores, iou_thres)
-            keep_all.extend(idxs[keep_idx_rel].tolist())
-        keep_all = sorted(set(keep_all))
-        return [dets[i].tolist() for i in keep_all]
-
-    def _map_to_original(self, x1, y1, x2, y2, pad_x, pad_y, sx, sy, W0, H0):
-        x1 = (x1 - pad_x) / sx
-        y1 = (y1 - pad_y) / sy
-        x2 = (x2 - pad_x) / sx
-        y2 = (y2 - pad_y) / sy
-        x1 = float(np.clip(x1, 0, W0 - 1))
-        y1 = float(np.clip(y1, 0, H0 - 1))
-        x2 = float(np.clip(x2, 0, W0 - 1))
-        y2 = float(np.clip(y2, 0, H0 - 1))
-        return x1, y1, x2, y2
-
-    def _choose_best_mapping(self, b, pad_x, pad_y, sx, sy, W0, H0):
-        # Candidate A: assume b is letterboxed coords → map back
-        xa1, ya1, xa2, ya2 = self._map_to_original(b[0], b[1], b[2], b[3], pad_x, pad_y, sx, sy, W0, H0)
-        area_a = max(0.0, xa2 - xa1) * max(0.0, ya2 - ya1)
-        # Candidate B: assume b is already original coords → use directly
-        xb1 = float(np.clip(b[0], 0, W0 - 1))
-        yb1 = float(np.clip(b[1], 0, H0 - 1))
-        xb2 = float(np.clip(b[2], 0, W0 - 1))
-        yb2 = float(np.clip(b[3], 0, H0 - 1))
-        area_b = max(0.0, xb2 - xb1) * max(0.0, yb2 - yb1)
-        # Heuristic: choose the one with larger valid area and not degenerate at origin
-        def quality(x1, y1, x2, y2, area):
-            cx = (x1 + x2) * 0.5
-            cy = (y1 + y2) * 0.5
-            near_origin = (cx < 5 and cy < 5)
-            return (0 if near_origin else 1, area)
-        qa = quality(xa1, ya1, xa2, ya2, area_a)
-        qb = quality(xb1, yb1, xb2, yb2, area_b)
-        if qb > qa:
-            return xb1, yb1, xb2, yb2
-        return xa1, ya1, xa2, ya2
-
-    def _parse_outputs(self, outputs, input_hw, orig_hw, pad, scale):
-        # Try EfficientNMS 4-output layout: [num_dets], [boxes], [scores], [classes]
-        dets = []
+    def _postprocess(self, outputs, input_hw, orig_hw, pad, scale):
+        """
+        Parses the raw model output to generate final bounding boxes.
+        This is the corrected and simplified post-processing logic.
+        """
         H_in, W_in = input_hw
         H0, W0 = orig_hw
         pad_x, pad_y = pad
-        sx, sy = scale, scale
+        
+        # The output of a standard YOLO model is typically (1, num_classes + 4, num_proposals)
+        # We need to transpose it to (num_proposals, num_classes + 4)
+        output = outputs[0].squeeze().T 
+        
+        # In this format, each row is a detection proposal: [cx, cy, w, h, class_prob_1, class_prob_2, ...]
+        boxes_coords = output[:, :4]
+        scores = output[:, 4:]
 
-        if len(outputs) == 4 and outputs[0].dtype in (np.int32, np.int64):
-            num = int(outputs[0].ravel()[0])
-            boxes = outputs[1].reshape(-1, 4)[:num]
-            scores = outputs[2].reshape(-1)[:num]
-            classes = outputs[3].reshape(-1)[:num].astype(int)
-            # Determine normalized
-            is_norm = None
-            if self.force_normalized in ("1", "true", "yes"):
-                is_norm = True
-            elif self.force_normalized in ("0", "false", "no"):
-                is_norm = False
-            # If coordinates look normalized (<=1.5), scale to letterboxed pixels
-            if is_norm is True or (is_norm is None and boxes.size and np.max(boxes) <= 1.5):
-                scale_vec = np.array([W_in, H_in, W_in, H_in], dtype=boxes.dtype)
-                boxes = boxes * scale_vec
-            # Convert center format if forced
-            if self.force_format == 'cxcywh':
-                cx, cy, w, h = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
-                x1 = cx - w / 2
-                y1 = cy - h / 2
-                x2 = cx + w / 2
-                y2 = cy + h / 2
-                boxes = np.stack([x1, y1, x2, y2], axis=1)
-            for b, s, c in zip(boxes, scores, classes):
-                if s < self.conf_threshold:
-                    continue
-                # Try xyxy order
-                x1, y1, x2, y2 = b
-                X1a, Y1a, X2a, Y2a = self._choose_best_mapping([x1, y1, x2, y2], pad_x, pad_y, sx, sy, W0, H0)
-                area_a = max(0.0, X2a - X1a) * max(0.0, Y2a - Y1a)
-                # Try yx order fallback
-                y1b, x1b, y2b, x2b = b
-                X1b, Y1b, X2b, Y2b = self._choose_best_mapping([x1b, y1b, x2b, y2b], pad_x, pad_y, sx, sy, W0, H0)
-                area_b = max(0.0, X2b - X1b) * max(0.0, Y2b - Y1b)
-                if area_b > area_a and (X2b > X1b) and (Y2b > Y1b):
-                    X1a, Y1a, X2a, Y2a = X1b, Y1b, X2b, Y2b
-                dets.append([X1a, Y1a, X2a, Y2a, float(s), int(c) + self.class_offset])
-            # Extra safety NMS to reduce duplicates from some engines
-            dets = self._apply_classwise_nms(dets, self.iou_threshold)
-            return dets
+        # Get the class ID and confidence score for each proposal
+        class_ids = np.argmax(scores, axis=1)
+        confidences = np.max(scores, axis=1)
 
-        # Generic output cases
-        out = outputs[0]
-        if out.ndim == 3:
-            out = out[0]
-        # Special case: (6, N) → channels are [x1,y1,x2,y2,cls0,cls1]
-        if out.ndim == 2 and out.shape[0] == 6 and out.shape[1] > 16:
-            pred = out.transpose(1, 0)  # (N, 6)
-            boxes_xyxy = pred[:, 0:4].astype(np.float32)
-            cls2 = pred[:, 4:6].astype(np.float32)
-            # If logits, sigmoid to probs
-            if np.max(cls2) > 1.0:
-                cls2 = 1.0 / (1.0 + np.exp(-cls2))
-            scores = np.max(cls2, axis=1)
-            cls_ids = np.argmax(cls2, axis=1).astype(np.int32)
+        # Filter out detections below the confidence threshold
+        mask = confidences > self.conf_threshold
+        boxes_coords = boxes_coords[mask]
+        confidences = confidences[mask]
+        class_ids = class_ids[mask]
 
-            # Filter by threshold
-            mask = scores >= self.conf_threshold
-            boxes_xyxy = boxes_xyxy[mask]
-            scores = scores[mask]
-            cls_ids = cls_ids[mask]
+        if len(boxes_coords) == 0:
+            return []
 
-            # Normalize handling: if clearly normalized, scale to letterbox
-            if boxes_xyxy.size and np.max(boxes_xyxy) <= 1.5:
-                scale_vec = np.array([W_in, H_in, W_in, H_in], dtype=boxes_xyxy.dtype)
-                boxes_xyxy = boxes_xyxy * scale_vec
+        # The model outputs normalized [center_x, center_y, width, height]
+        # We must scale them to pixel coordinates in the letterboxed image space
+        boxes_coords[:, 0] *= W_in  # center_x
+        boxes_coords[:, 1] *= H_in  # center_y
+        boxes_coords[:, 2] *= W_in  # width
+        boxes_coords[:, 3] *= H_in  # height
 
-            # Map to original or clamp if already in original
-            boxes_mapped = []
-            if boxes_xyxy.size:
-                if np.max(boxes_xyxy) <= max(W_in, H_in) + 1.0:
-                    # Treat as letterboxed coords
-                    for (x1, y1, x2, y2) in boxes_xyxy:
-                        x1, y1, x2, y2 = self._map_to_original(x1, y1, x2, y2, pad_x, pad_y, sx, sy, W0, H0)
-                        boxes_mapped.append([x1, y1, x2, y2])
-                else:
-                    # Already in original image space
-                    for (x1, y1, x2, y2) in boxes_xyxy:
-                        x1 = float(np.clip(x1, 0, W0 - 1))
-                        y1 = float(np.clip(y1, 0, H0 - 1))
-                        x2 = float(np.clip(x2, 0, W0 - 1))
-                        y2 = float(np.clip(y2, 0, H0 - 1))
-                        boxes_mapped.append([x1, y1, x2, y2])
+        # Convert [center_x, center_y, width, height] to [x, y, w, h] for NMS
+        # Note: cv2.dnn.NMSBoxes expects [x_top_left, y_top_left, width, height]
+        x = boxes_coords[:, 0] - boxes_coords[:, 2] / 2
+        y = boxes_coords[:, 1] - boxes_coords[:, 3] / 2
+        w = boxes_coords[:, 2]
+        h = boxes_coords[:, 3]
+        
+        nms_boxes = [[int(val) for val in box] for box in zip(x, y, w, h)]
+        
+        # Perform Non-Maximum Suppression (NMS)
+        indices = cv2.dnn.NMSBoxes(nms_boxes, confidences, self.conf_threshold, self.iou_threshold)
+        
+        if len(indices) == 0:
+            return []
 
-            # NMS
-            keep = self._nms(boxes_mapped, scores.tolist(), self.iou_threshold)
-            dets = []
-            for i in keep:
-                x1, y1, x2, y2 = boxes_mapped[i]
-                if (x2 - x1) < 2 or (y2 - y1) < 2:
-                    continue
-                cls_final = max(0, int(cls_ids[i]) + self.class_offset)
-                dets.append([x1, y1, x2, y2, float(scores[i]), cls_final])
-            return dets
-        # Case A: shape (C,N) -> transpose to (N,C)
-        if out.ndim == 2 and out.shape[0] in (6, 7, 8) and out.shape[1] > 16:
-            out = out.transpose(1, 0)
+        # Flatten indices if it's a nested list
+        indices = indices.flatten()
 
-        # Case B: last-dim layout (N,M)
-        if out.shape[-1] >= 6:
-            boxes_xywh = out[:, :4]
-            obj_conf = out[:, 4]
-            if out.shape[-1] > 6:
-                cls_scores = out[:, 5:]
-                cls_ids = np.argmax(cls_scores, axis=1)
-                cls_conf = cls_scores[np.arange(cls_scores.shape[0]), cls_ids]
-                scores = obj_conf * cls_conf
-            else:
-                # Exactly 6 outputs per candidate: [cx,cy,w,h,conf,clsId] or [x1,y1,x2,y2,conf,clsId]
-                scores = obj_conf
-                cls_ids = out[:, 5].astype(np.int32)
+        detections = []
+        for i in indices:
+            # Get the box coordinates in the letterboxed image space
+            box_x, box_y, box_w, box_h = nms_boxes[i]
+            
+            # Map coordinates back from letterboxed space to original image space
+            final_x1 = (box_x - pad_x) / scale
+            final_y1 = (box_y - pad_y) / scale
+            final_x2 = (box_x + box_w - pad_x) / scale
+            final_y2 = (box_y + box_h - pad_y) / scale
 
-            # Filter by conf
-            mask = scores >= self.conf_threshold
-            boxes_xywh = boxes_xywh[mask]
-            scores = scores[mask]
-            cls_ids = cls_ids[mask]
+            # Clip coordinates to ensure they are within the image boundaries
+            final_x1 = float(np.clip(final_x1, 0, W0 - 1))
+            final_y1 = float(np.clip(final_y1, 0, H0 - 1))
+            final_x2 = float(np.clip(final_x2, 0, W0 - 1))
+            final_y2 = float(np.clip(final_y2, 0, H0 - 1))
 
-            # Scale normalized if needed
-            is_norm = None
-            if self.force_normalized in ("1", "true", "yes"):
-                is_norm = True
-            elif self.force_normalized in ("0", "false", "no"):
-                is_norm = False
-            if boxes_xywh.size and (is_norm is True or (is_norm is None and np.max(boxes_xywh) <= 1.5)):
-                if self.force_format == 'xyxy':
-                    scale_vec = np.array([W_in, H_in, W_in, H_in], dtype=boxes_xywh.dtype)
-                    boxes_xywh = boxes_xywh * scale_vec
-                else:
-                    # cx,cy,w,h normalized
-                    scale_vec = np.array([W_in, H_in, W_in, H_in], dtype=boxes_xywh.dtype)
-                    boxes_xywh = boxes_xywh * scale_vec
-
-            # Convert to xyxy in letterboxed space
-            if self.force_format == 'xyxy':
-                boxes_xyxy = boxes_xywh
-            else:
-                xy = boxes_xywh[:, :2]
-                wh = boxes_xywh[:, 2:4]
-                x1y1 = xy - wh / 2
-                x2y2 = xy + wh / 2
-                boxes_xyxy = np.concatenate([x1y1, x2y2], axis=1)
-
-            # If normalized, scale to letterboxed pixel coords
-            if boxes_xyxy.size and np.max(boxes_xyxy) <= 1.5:
-                scale_vec = np.array([W_in, H_in, W_in, H_in], dtype=boxes_xyxy.dtype)
-                boxes_xyxy = boxes_xyxy * scale_vec
-
-            # Map back to original image
-            boxes_mapped = []
-            # Heuristic: if coordinates clearly exceed letterbox size, treat as already in original space
-            treat_as_orig = boxes_xyxy.size and (np.max(boxes_xyxy) > max(W_in, H_in) * 1.5)
-            for (x1, y1, x2, y2) in boxes_xyxy:
-                if treat_as_orig:
-                    x1 = float(np.clip(x1, 0, W0 - 1))
-                    y1 = float(np.clip(y1, 0, H0 - 1))
-                    x2 = float(np.clip(x2, 0, W0 - 1))
-                    y2 = float(np.clip(y2, 0, H0 - 1))
-                else:
-                    x1, y1, x2, y2 = self._choose_best_mapping([x1, y1, x2, y2], pad_x, pad_y, sx, sy, W0, H0)
-                boxes_mapped.append([x1, y1, x2, y2])
-
-            # NMS
-            keep = self._nms(boxes_mapped, scores.tolist(), self.iou_threshold)
-            dets = []
-            for i in keep:
-                x1, y1, x2, y2 = boxes_mapped[i]
-                # skip degenerate tiny boxes
-                if (x2 - x1) < 2 or (y2 - y1) < 2:
-                    continue
-                cls_final = max(0, int(cls_ids[i]) + self.class_offset)
-                dets.append([x1, y1, x2, y2, float(scores[i]), cls_final])
-            return dets
-
-        # Unknown format
-        return []
+            detections.append([final_x1, final_y1, final_x2, final_y2, float(confidences[i]), int(class_ids[i])])
+            
+        return detections
 
     def infer(self, image_bgr):
-        # Preprocess
+        """
+        Performs a full inference cycle: preprocess, inference, and post-process.
+        """
+        # --- Preprocessing ---
         _, c, H, W = self.input_shape
-        assert c == 3, "Model expects 3-channel input"
+        assert c == 3, "Model expects a 3-channel input image"
+        
         img_letter, scale, pad = self._letterbox(image_bgr, (H, W))
         img_rgb = cv2.cvtColor(img_letter, cv2.COLOR_BGR2RGB)
-        img_chw = img_rgb.transpose(2, 0, 1).astype(np.float32) / 255.0
-        input_data = np.ascontiguousarray(img_chw)
+        
+        # Transpose from HWC to CHW and normalize to [0, 1]
+        input_data = np.transpose(img_rgb, (2, 0, 1)).astype(np.float32) / 255.0
+        input_data = np.ascontiguousarray(input_data)
+        
+        # Copy preprocessed image data to the host buffer
+        np.copyto(self.host_inputs[0], input_data.ravel())
 
-        # Set binding shape if dynamic
-        try:
-            self.context.set_binding_shape(self.input_index, self.input_shape)
-        except Exception:
-            pass
-
-        # Copy to device
-        np.copyto(self.host_buffers[self.input_index], input_data.ravel())
-        cuda.memcpy_htod_async(self.device_buffers[self.input_index], self.host_buffers[self.input_index], self.stream)
-
-        # Execute
-        self.context.execute_async_v2(self.bindings, self.stream.handle, None)
-
-        # Copy outputs back
-        outputs = []
-        for i in self.output_indices:
-            cuda.memcpy_dtoh_async(self.host_buffers[i], self.device_buffers[i], self.stream)
+        # --- Inference ---
+        # Transfer input data from host to device (GPU)
+        cuda.memcpy_htod_async(self.device_inputs[0], self.host_inputs[0], self.stream)
+        
+        # Execute the model
+        self.context.execute_async_v2(bindings=self.bindings, stream_handle=self.stream.handle)
+        
+        # Transfer output data from device back to host
+        for i in range(len(self.host_outputs)):
+            cuda.memcpy_dtoh_async(self.host_outputs[i], self.device_outputs[i], self.stream)
+            
+        # Wait for the stream to finish all operations
         self.stream.synchronize()
-        for i in self.output_indices:
-            shape = tuple(self.context.get_binding_shape(i))
-            vol = int(np.prod(shape)) if all(d > 0 for d in shape) else self.host_buffers[i].size
-            arr = np.array(self.host_buffers[i])[:vol]
-            if all(d > 0 for d in shape):
-                try:
-                    arr = arr.reshape(shape)
-                except Exception:
-                    pass
-            outputs.append(arr)
 
-        # Postprocess
+        # --- Post-processing ---
+        # Reshape the flattened output to its original shape
+        outputs = [out.reshape(self.engine.get_binding_shape(i+1)) for i, out in enumerate(self.host_outputs)]
+        
         H0, W0 = image_bgr.shape[:2]
-        detections = self._parse_outputs(outputs, (self.input_shape[2], self.input_shape[3]), (H0, W0), pad, scale)
-        if self.debug:
-            try:
-                dbg = ", ".join([f"[{int(d[5])}:{d[4]:.2f}]({int(d[0])},{int(d[1])},{int(d[2])},{int(d[3])})" for d in detections[:5]])
-                print(f"[TRT DEBUG] dets: {dbg}")
-            except Exception:
-                pass
+        detections = self._postprocess(outputs, (H, W), (H0, W0), pad, scale)
+        
         return detections
 
 
@@ -478,7 +247,7 @@ class GlaucomaApplicationTRT(tk.Tk):
         self.detection_mode = 'camera'
         self.imported_image = None
         self.imported_image_path = None
-        self.display_locked = False  # Prevent camera updates from overwriting imported images
+        self.display_locked = False
 
         # Backend info
         self.backend = 'tensorrt'
@@ -497,7 +266,6 @@ class GlaucomaApplicationTRT(tk.Tk):
         self.processing_started = False
         self.camera_running = True
 
-        # Initialize UI mode after all variables are set
         self.switch_mode()
         
         self.update_frames_thread = threading.Thread(target=self.update_frames)
@@ -505,836 +273,469 @@ class GlaucomaApplicationTRT(tk.Tk):
         self.update_frames_thread.start()
 
     def setup_model(self):
-        """Initialize the TensorRT engine for glaucoma detection (no Ultralytics)."""
-        # Fixed expected engine path on device
+        """Initialize the TensorRT engine for glaucoma detection."""
         self.model_path = os.path.join("model_results", "runs", "train", "glaucoma_yolo11", "weights", "best.engine")
-        if not os.path.exists(self.model_path):
-            # Also try Windows-style path separator edge cases
-            alt_path = os.path.join("model_results", "runs", "train", "glaucoma_yolo11", "weights", "best.engine")
-            if os.path.exists(alt_path):
-                self.model_path = alt_path
+        
         try:
-            self.detector = TRTDetector(self.model_path, conf_threshold=0.25, iou_threshold=0.7)
-            self.backend = 'tensorrt'
-            self.device = 'gpu'
-            # Class names from YAML
-            self.class_names = self._resolve_class_names(None)
+            conf_th = float(os.environ.get("GL_TRT_CONF", "0.25"))
+            iou_th = float(os.environ.get("GL_TRT_IOU", "0.45"))
+            
+            self.detector = TRTDetector(self.model_path, conf_threshold=conf_th, iou_threshold=iou_th)
+            
+            self.class_names = self._resolve_class_names()
             self.colors = [[np.random.randint(0, 255) for _ in range(3)] for _ in range(len(self.class_names))]
-            self.log_to_console(f"TensorRT engine loaded: {self.model_path}")
-            # Log binding info for troubleshooting
-            try:
-                eng = self.detector.engine
-                for i in range(eng.num_bindings):
-                    name = eng.get_binding_name(i)
-                    shape = self.detector.context.get_binding_shape(i)
-                    dtype = eng.get_binding_dtype(i)
-                    io = 'input' if eng.binding_is_input(i) else 'output'
-                    self.log_to_console(f"Binding[{i}] {io} '{name}' shape={tuple(shape)} dtype={dtype}")
-            except Exception:
-                pass
+            
+            self.log_to_console(f"TensorRT engine loaded successfully: {self.model_path}")
             self.log_to_console(f"Classes: {list(self.class_names.values())}")
         except Exception as e:
-            self.log_to_console(f"Engine loading failed: {e}")
+            self.log_to_console(f"FATAL: Engine loading failed: {e}")
             messagebox.showerror("Error", f"Failed to load TensorRT engine: {e}")
 
-    def _resolve_class_names(self, names_obj):
-        """Return a dict index->name from dataset YAML fallback."""
-        # Try dataset YAML
-        yaml_candidates = [
-            os.environ.get("GL_CLASSES_YAML"),
-            os.path.join("model_results", "data", "glaucoma.yaml"),
-        ]
-        for ypath in yaml_candidates:
-            try:
-                if ypath and os.path.exists(ypath):
-                    with open(ypath, 'r', encoding='utf-8') as f:
-                        data = yaml.safe_load(f)
-                        names_list = data.get('names')
-                        if isinstance(names_list, list) and len(names_list) > 0:
-                            self.log_to_console(f"Loaded class names from YAML: {ypath}")
-                            return {i: n for i, n in enumerate(names_list)}
-            except Exception as e:
-                self.log_to_console(f"Failed to read class names YAML: {e}")
+    def _resolve_class_names(self):
+        """Loads class names from a YAML file or uses a default."""
+        yaml_path = os.path.join("model_results", "data", "glaucoma.yaml")
+        try:
+            if os.path.exists(yaml_path):
+                with open(yaml_path, 'r', encoding='utf-8') as f:
+                    data = yaml.safe_load(f)
+                    names_list = data.get('names')
+                    if isinstance(names_list, list) and len(names_list) > 0:
+                        self.log_to_console(f"Loaded class names from YAML: {yaml_path}")
+                        return {i: n for i, n in enumerate(names_list)}
+        except Exception as e:
+            self.log_to_console(f"Warning: Could not read class names from YAML: {e}")
 
-        # Last resort: binary class setup
-        self.log_to_console("Falling back to default class names: ['healthy', 'glaucoma']")
+        self.log_to_console("Warning: Falling back to default class names: ['healthy', 'glaucoma']")
         return {0: 'healthy', 1: 'glaucoma'}
 
+    # --- GUI Creation Methods (unchanged from original) ---
     def create_widgets(self):
-        """Create the main GUI layout"""
-        # Header with logos and title
         self.create_header()
-        
-        # Main content area with three columns
         self.create_main_content()
-        
-        # Console log at bottom
         self.create_console()
 
     def create_header(self):
-        """Create header with logos and title"""
         header_frame = tk.Frame(self)
         header_frame.grid(row=0, column=0, columnspan=3, padx=10, pady=10, sticky="ew")
-        
-        # Title
         title_label = tk.Label(header_frame, text="Glaucoma Detection System (TensorRT)", 
                               font=("Helvetica", 24, "bold"))
         title_label.pack(pady=10)
 
     def create_main_content(self):
-        """Create the main content area with three columns"""
-        # Left column - Patient Information
         self.create_patient_form()
-        
-        # Middle column - Camera and controls
         self.create_camera_section()
-        
-        # Right column - Doctor Information and Results
         self.create_doctor_results_section()
 
     def create_patient_form(self):
-        """Create patient information form"""
         patient_frame = tk.LabelFrame(self, text="Patient Information", font=("Helvetica", 12, "bold"))
         patient_frame.grid(row=1, column=0, padx=10, pady=10, sticky="nsew", ipadx=10, ipady=10)
-
-        # Patient form fields
         tk.Label(patient_frame, text="Patient ID:").grid(row=0, column=0, sticky="w", pady=5)
         self.patient_id_var = tk.StringVar()
         tk.Entry(patient_frame, textvariable=self.patient_id_var, width=20).grid(row=0, column=1, pady=5)
-
         tk.Label(patient_frame, text="Patient Name:").grid(row=1, column=0, sticky="w", pady=5)
         self.patient_name_var = tk.StringVar()
         tk.Entry(patient_frame, textvariable=self.patient_name_var, width=20).grid(row=1, column=1, pady=5)
-
         tk.Label(patient_frame, text="Age:").grid(row=2, column=0, sticky="w", pady=5)
         self.patient_age_var = tk.StringVar()
         tk.Entry(patient_frame, textvariable=self.patient_age_var, width=20).grid(row=2, column=1, pady=5)
-
         tk.Label(patient_frame, text="Gender:").grid(row=3, column=0, sticky="w", pady=5)
         self.patient_gender_var = tk.StringVar()
         gender_combo = ttk.Combobox(patient_frame, textvariable=self.patient_gender_var, 
                                    values=["Male", "Female", "Other"], width=17, state="readonly")
         gender_combo.grid(row=3, column=1, pady=5)
-
         tk.Label(patient_frame, text="Phone:").grid(row=4, column=0, sticky="w", pady=5)
         self.patient_phone_var = tk.StringVar()
         tk.Entry(patient_frame, textvariable=self.patient_phone_var, width=20).grid(row=4, column=1, pady=5)
-
         tk.Label(patient_frame, text="Medical History:").grid(row=5, column=0, sticky="w", pady=5)
         self.patient_history_text = tk.Text(patient_frame, width=20, height=4)
         self.patient_history_text.grid(row=5, column=1, pady=5)
-
-        # Clear patient form button
         tk.Button(patient_frame, text="Clear Form", command=self.clear_patient_form,
                  bg="#ffcccc").grid(row=6, column=0, columnspan=2, pady=10)
 
     def create_camera_section(self):
-        """Create camera display and control section"""
         camera_frame = tk.LabelFrame(self, text="Eye Examination", font=("Helvetica", 12, "bold"))
         camera_frame.grid(row=1, column=1, padx=10, pady=10, sticky="nsew")
-
-        # Mode selection
         mode_frame = tk.Frame(camera_frame)
         mode_frame.grid(row=0, column=0, pady=5)
-        
         tk.Label(mode_frame, text="Detection Mode:", font=("Helvetica", 10, "bold")).grid(row=0, column=0, padx=5)
-        
         self.mode_var = tk.StringVar(value="camera")
         tk.Radiobutton(mode_frame, text="Camera Stream", variable=self.mode_var, value="camera",
                       command=self.switch_mode).grid(row=0, column=1, padx=5)
         tk.Radiobutton(mode_frame, text="Import Image", variable=self.mode_var, value="image",
                       command=self.switch_mode).grid(row=0, column=2, padx=5)
-
-        # Camera display
         self.camera_label = tk.Label(camera_frame, text="Camera Stream")
         self.camera_label.grid(row=1, column=0, pady=10)
-        
         self.camera_frame_widget = tk.Label(camera_frame)
         self.camera_frame_widget.grid(row=2, column=0, pady=10)
-
-        # Control buttons
         control_frame = tk.Frame(camera_frame)
         control_frame.grid(row=3, column=0, pady=10)
-
-        # Camera controls (row 0)
         self.camera_controls_frame = tk.Frame(control_frame)
         self.camera_controls_frame.grid(row=0, column=0, columnspan=3, pady=5)
-        
         tk.Label(self.camera_controls_frame, text="Select Camera:").grid(row=0, column=0, padx=5, pady=5)
         self.camera_var = tk.StringVar(value="None")
         self.camera_dropdown = ttk.Combobox(self.camera_controls_frame, textvariable=self.camera_var, width=15)
         self.camera_dropdown.grid(row=0, column=1, padx=5, pady=5)
-        
         tk.Button(self.camera_controls_frame, text="Refresh Cameras", command=self.refresh_cameras
                  ).grid(row=0, column=2, padx=5, pady=5)
-        
         tk.Button(self.camera_controls_frame, text="Apply Camera", command=self.apply_selected_camera
                  ).grid(row=1, column=0, padx=5, pady=5)
-        
-        # Image import controls (row 1)
         self.image_controls_frame = tk.Frame(control_frame)
         self.image_controls_frame.grid(row=1, column=0, columnspan=3, pady=5)
-        
         tk.Button(self.image_controls_frame, text="Import Image", command=self.import_image,
                  bg="#ffcc99").grid(row=0, column=0, padx=5, pady=5)
-        
         self.image_path_label = tk.Label(self.image_controls_frame, text="No image selected", 
                                         wraplength=300, justify="left")
         self.image_path_label.grid(row=0, column=1, padx=5, pady=5)
-
-        # Detection controls (row 2)
         self.start_button = tk.Button(control_frame, text="Start Live Detection", 
                                      command=self.toggle_detection, bg="#ccffcc")
         self.start_button.grid(row=2, column=0, padx=5, pady=5)
-        
         self.capture_button = tk.Button(control_frame, text="Analyze Current", 
                                        command=self.capture_and_analyze, bg="#ccccff")
         self.capture_button.grid(row=2, column=1, padx=5, pady=5)
-        
-        # Initialize camera list
         self.refresh_cameras()
 
     def create_doctor_results_section(self):
-        """Create doctor information and results section"""
-        # Doctor Information
         doctor_frame = tk.LabelFrame(self, text="Doctor Information", font=("Helvetica", 12, "bold"))
         doctor_frame.grid(row=1, column=2, padx=10, pady=10, sticky="nsew", ipadx=10, ipady=10)
-        
         tk.Label(doctor_frame, text="Doctor ID:").grid(row=0, column=0, sticky="w", pady=5)
         self.doctor_id_var = tk.StringVar()
         tk.Entry(doctor_frame, textvariable=self.doctor_id_var, width=20).grid(row=0, column=1, pady=5)
-        
         tk.Label(doctor_frame, text="Doctor Name:").grid(row=1, column=0, sticky="w", pady=5)
         self.doctor_name_var = tk.StringVar()
         tk.Entry(doctor_frame, textvariable=self.doctor_name_var, width=20).grid(row=1, column=1, pady=5)
-        
         tk.Label(doctor_frame, text="Specialization:").grid(row=2, column=0, sticky="w", pady=5)
         self.doctor_spec_var = tk.StringVar()
         spec_combo = ttk.Combobox(doctor_frame, textvariable=self.doctor_spec_var,
                                  values=["Ophthalmologist", "General Practitioner", "Specialist"], 
                                  width=17, state="readonly")
         spec_combo.grid(row=2, column=1, pady=5)
-        
         tk.Label(doctor_frame, text="Hospital/Clinic:").grid(row=3, column=0, sticky="w", pady=5)
         self.doctor_hospital_var = tk.StringVar()
         tk.Entry(doctor_frame, textvariable=self.doctor_hospital_var, width=20).grid(row=3, column=1, pady=5)
-        
-        # Results section
         results_frame = tk.LabelFrame(doctor_frame, text="Detection Results")
         results_frame.grid(row=4, column=0, columnspan=2, pady=10, sticky="ew")
-        
         self.result_label = tk.Label(results_frame, text="No analysis performed yet", 
                                     font=("Helvetica", 10), wraplength=200)
         self.result_label.pack(pady=10)
-        
-        # Action buttons
         button_frame = tk.Frame(doctor_frame)
         button_frame.grid(row=5, column=0, columnspan=2, pady=10)
-        
         tk.Button(button_frame, text="Clear Doctor Form", command=self.clear_doctor_form,
                  bg="#ffcccc").pack(side=tk.LEFT, padx=5)
-        
         tk.Button(button_frame, text="Send to Server", command=self.send_to_server,
                  bg="#ffffcc").pack(side=tk.LEFT, padx=5)
 
     def create_console(self):
-        """Create console log section"""
         console_frame = tk.LabelFrame(self, text="System Log", font=("Helvetica", 10, "bold"))
         console_frame.grid(row=2, column=0, columnspan=3, padx=10, pady=10, sticky="ew")
-        
         self.console_log = scrolledtext.ScrolledText(console_frame, width=120, height=8, state='disabled')
         self.console_log.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
+    # --- GUI Logic and Application Flow (mostly unchanged) ---
     def refresh_cameras(self):
-        """Scan and update available cameras"""
         available_cameras = []
         for idx in range(4):
             cap = cv2.VideoCapture(idx)
             if cap.isOpened():
                 available_cameras.append(str(idx))
             cap.release()
-        
         self.camera_dropdown['values'] = ["None"] + available_cameras
         if available_cameras:
-            self.camera_dropdown.current(1)  # Select first available camera
+            self.camera_dropdown.current(1)
 
     def switch_mode(self):
-        """Switch between camera and image modes"""
         self.detection_mode = self.mode_var.get()
-        
         if self.detection_mode == "camera":
-            # Show camera controls, hide image controls
             self.camera_controls_frame.grid()
             self.image_controls_frame.grid_remove()
             self.camera_label.config(text="Camera Stream")
             self.start_button.config(text="Start Live Detection", state="normal", bg="#ccffcc")
             self.capture_button.config(text="Capture & Analyze")
-            
-            # Unlock display for camera updates
             self.display_locked = False
-            
-            # Stop live detection if running
-            if self.processing_started:
-                self.processing_started = False
-                
-        else:  # image mode
-            # Hide camera controls, show image controls
+            if self.processing_started: self.processing_started = False
+        else:
             self.camera_controls_frame.grid_remove()
             self.image_controls_frame.grid()
             self.camera_label.config(text="Imported Image")
             self.start_button.config(text="Live Detection (N/A)", state="disabled", bg="#cccccc")
             self.capture_button.config(text="Analyze Image")
-            
-            # Stop live detection and release camera
-            if self.processing_started:
-                self.processing_started = False
+            if self.processing_started: self.processing_started = False
             if self.cap is not None:
                 self.cap.release()
                 self.cap = None
-                
-            # Keep display locked if image is imported, otherwise show placeholder
             if self.imported_image is None:
                 self.display_locked = False
-                # Show placeholder for image mode
                 self.show_image_placeholder()
-                
         self.log_to_console(f"Switched to {self.detection_mode} mode")
 
     def show_image_placeholder(self):
-        """Show placeholder when in image mode with no image imported"""
-        try:
-            # Create placeholder image
-            placeholder = np.zeros((375, 500, 3), dtype=np.uint8)
-            placeholder.fill(50)  # Dark gray background
-            
-            # Add text
-            cv2.putText(placeholder, "No Image Imported", (140, 180), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-            cv2.putText(placeholder, "Click 'Import Image' to select a file", (90, 220), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
-            
-            # Convert to PhotoImage and display
-            img = Image.fromarray(placeholder)
-            imgtk = ImageTk.PhotoImage(image=img)
-            
-            self.camera_frame_widget.config(image=imgtk)
-            self.camera_frame_widget.image = imgtk
-            
-        except Exception as e:
-            self.log_to_console(f"Error showing placeholder: {e}")
+        placeholder = np.zeros((375, 500, 3), dtype=np.uint8)
+        placeholder.fill(50)
+        cv2.putText(placeholder, "No Image Imported", (140, 180), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+        cv2.putText(placeholder, "Click 'Import Image' to select a file", (90, 220), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+        img = Image.fromarray(placeholder)
+        imgtk = ImageTk.PhotoImage(image=img)
+        self.camera_frame_widget.config(image=imgtk)
+        self.camera_frame_widget.image = imgtk
 
     def import_image(self):
-        """Import an image file for analysis"""
-        file_types = [
-            ('Image files', '*.jpg *.jpeg *.png *.bmp *.tiff *.tif'),
-            ('JPEG files', '*.jpg *.jpeg'),
-            ('PNG files', '*.png'),
-            ('All files', '*.*')
-        ]
-        
-        file_path = filedialog.askopenfilename(
-            title="Select Eye Image for Glaucoma Detection",
-            filetypes=file_types,
-            initialdir=os.getcwd()
-        )
-        
+        file_path = filedialog.askopenfilename(title="Select Eye Image", filetypes=[('Image files', '*.jpg *.jpeg *.png *.bmp'), ('All files', '*.*')])
         if file_path:
             try:
-                # Load and validate image
                 self.imported_image = cv2.imread(file_path)
-                if self.imported_image is None:
-                    raise ValueError("Could not load image file")
-                
+                if self.imported_image is None: raise ValueError("Could not load image")
                 self.imported_image_path = file_path
-                
-                # Update UI
                 filename = os.path.basename(file_path)
                 self.image_path_label.config(text=f"Selected: {filename}")
-                
-                # Display the imported image
                 self.display_imported_image()
-                
-                # Lock display to prevent camera updates from overwriting
                 self.display_locked = True
-                
-                self.log_to_console(f"Image imported successfully: {filename}")
-                
+                self.log_to_console(f"Image imported: {filename}")
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to import image: {e}")
                 self.log_to_console(f"Error importing image: {e}")
 
     def display_imported_image(self):
-        """Display the imported image in the camera frame"""
         if self.imported_image is not None:
-            try:
-                # Convert and resize for display
-                display_image = cv2.cvtColor(self.imported_image, cv2.COLOR_BGR2RGB)
-                height, width = display_image.shape[:2]
-                
-                # Calculate resize dimensions maintaining aspect ratio
-                max_width, max_height = 500, 375
-                if width > max_width or height > max_height:
-                    scale = min(max_width/width, max_height/height)
-                    new_width = int(width * scale)
-                    new_height = int(height * scale)
-                    display_image = cv2.resize(display_image, (new_width, new_height))
-                
-                # Convert to PhotoImage and display
-                img = Image.fromarray(display_image)
-                imgtk = ImageTk.PhotoImage(image=img)
-                
-                self.camera_frame_widget.config(image=imgtk)
-                self.camera_frame_widget.image = imgtk
-                
-            except Exception as e:
-                self.log_to_console(f"Error displaying imported image: {e}")
+            self.display_analysis_result(self.imported_image)
 
     def apply_selected_camera(self):
-        """Apply the selected camera"""
         camera_id = self.camera_var.get()
-        
-        if self.cap is not None:
-            self.cap.release()
-            
-        if camera_id != "None" and camera_id.isdigit():
+        if self.cap is not None: self.cap.release()
+        if camera_id.isdigit():
             self.cap = cv2.VideoCapture(int(camera_id))
-            if self.cap.isOpened():
-                self.log_to_console(f"Camera {camera_id} applied successfully")
-            else:
-                self.log_to_console(f"Error: Cannot open camera {camera_id}")
-                self.cap = None
+            self.log_to_console(f"Camera {camera_id} applied." if self.cap.isOpened() else f"Error: Cannot open camera {camera_id}")
         else:
             self.cap = None
 
     def toggle_detection(self):
-        """Toggle detection on/off"""
         self.processing_started = not self.processing_started
         if self.processing_started:
-            if self.detection_mode == "camera":
-                self.start_button.config(text="Stop Live Detection", bg="#ffcccc")
-                self.log_to_console("Live detection started")
-            else:
-                # Should not happen in image mode, but handle gracefully
-                self.processing_started = False
-                self.log_to_console("Live detection not available in image mode")
+            self.start_button.config(text="Stop Live Detection", bg="#ffcccc")
+            self.log_to_console("Live detection started")
         else:
-            if self.detection_mode == "camera":
-                self.start_button.config(text="Start Live Detection", bg="#ccffcc")
-                self.log_to_console("Live detection stopped")
+            self.start_button.config(text="Start Live Detection", bg="#ccffcc")
+            self.log_to_console("Live detection stopped")
 
     def capture_and_analyze(self):
-        """Capture current frame or analyze imported image"""
-        if not self.validate_forms():
-            return
-            
-        # Get the image to analyze based on current mode
+        if not self.validate_forms(): return
+        
         if self.detection_mode == "camera":
-            if self.frame is None:
-                messagebox.showerror("Error", "No camera feed available")
-                return
+            if self.frame is None: messagebox.showerror("Error", "No camera feed"); return
             analysis_image = self.frame.copy()
             source_info = "camera"
-        else:  # image mode
-            if self.imported_image is None:
-                messagebox.showerror("Error", "No image imported")
-                return
+        else:
+            if self.imported_image is None: messagebox.showerror("Error", "No image imported"); return
             analysis_image = self.imported_image.copy()
-            source_info = f"imported image: {os.path.basename(self.imported_image_path)}"
+            source_info = f"image: {os.path.basename(self.imported_image_path)}"
             
-        self.log_to_console(f"Performing glaucoma analysis on {source_info}...")
-        
-        # Process the image
+        self.log_to_console(f"Analyzing {source_info}...")
         analysis_result = self.analyze_for_glaucoma(analysis_image)
         
-        # Save the result image and the original image
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        result_filename = f"glaucoma_result_{timestamp}.jpg"
-        result_path = os.path.join("results", result_filename)
         os.makedirs("results", exist_ok=True)
-        
+        result_path = os.path.join("results", f"glaucoma_result_{timestamp}.jpg")
         cv2.imwrite(result_path, analysis_result['annotated_image'])
-        original_filename = f"glaucoma_original_{timestamp}.jpg"
-        original_path = os.path.join("results", original_filename)
-        try:
-            cv2.imwrite(original_path, analysis_image)
-            self.original_image_path = original_path
-        except Exception:
-            self.original_image_path = self.imported_image_path if self.detection_mode == "image" else None
         
-        # Update results
+        original_path = os.path.join("results", f"glaucoma_original_{timestamp}.jpg")
+        cv2.imwrite(original_path, analysis_image)
+        self.original_image_path = original_path
+        
         self.detection_result = analysis_result
         self.result_image = result_path
-        
-        # Update UI
         self.update_result_display(analysis_result)
         
-        # If in image mode, also display the result
         if self.detection_mode == "image":
             self.display_analysis_result(analysis_result['annotated_image'])
-            self.display_locked = True  # Keep the analysis result displayed
+            self.display_locked = True
         
-        self.log_to_console(f"Analysis completed. Result saved: {result_path}")
+        self.log_to_console(f"Analysis complete. Result saved: {result_path}")
 
-    def display_analysis_result(self, annotated_image):
-        """Display analysis result in the image frame"""
-        try:
-            # Convert and resize for display
-            display_image = cv2.cvtColor(annotated_image, cv2.COLOR_BGR2RGB)
-            height, width = display_image.shape[:2]
-            
-            # Calculate resize dimensions maintaining aspect ratio
-            max_width, max_height = 500, 375
-            if width > max_width or height > max_height:
-                scale = min(max_width/width, max_height/height)
-                new_width = int(width * scale)
-                new_height = int(height * scale)
-                display_image = cv2.resize(display_image, (new_width, new_height))
-            
-            # Convert to PhotoImage and display
-            img = Image.fromarray(display_image)
-            imgtk = ImageTk.PhotoImage(image=img)
-            
-            self.camera_frame_widget.config(image=imgtk)
-            self.camera_frame_widget.image = imgtk
-            
-        except Exception as e:
-            self.log_to_console(f"Error displaying analysis result: {e}")
+    def display_analysis_result(self, image_to_display):
+        display_image = cv2.cvtColor(image_to_display, cv2.COLOR_BGR2RGB)
+        h, w = display_image.shape[:2]
+        max_w, max_h = 500, 375
+        scale = min(max_w/w, max_h/h) if w > max_w or h > max_h else 1
+        new_w, new_h = int(w * scale), int(h * scale)
+        display_image = cv2.resize(display_image, (new_w, new_h))
+        
+        img = Image.fromarray(display_image)
+        imgtk = ImageTk.PhotoImage(image=img)
+        self.camera_frame_widget.config(image=imgtk)
+        self.camera_frame_widget.image = imgtk
 
     def _get_class_name(self, cls_id):
-        try:
-            if isinstance(self.class_names, dict):
-                return self.class_names.get(int(cls_id), str(cls_id))
-            # list fallback
-            idx = int(cls_id)
-            return self.class_names[idx] if 0 <= idx < len(self.class_names) else str(cls_id)
-        except Exception:
-            return str(cls_id)
+        return self.class_names.get(int(cls_id), f"Class_{cls_id}")
 
     def analyze_for_glaucoma(self, frame):
-        """Analyze frame for glaucoma detection using TensorRT engine."""
-        result = {
-            'has_glaucoma': False,
-            'confidence': 0.0,
-            'detected_features': [],
-            'annotated_image': frame.copy()
-        }
-        
+        result = {'has_glaucoma': False, 'confidence': 0.0, 'detected_features': [], 'annotated_image': frame.copy()}
         try:
-            # Run TRT inference
             detections = self.detector.infer(frame)
-            if getattr(self.detector, 'debug', False) and detections:
-                try:
-                    self.log_to_console(f"Parsed {len(detections)} detections; first: {detections[0]}")
-                except Exception:
-                    pass
-            
-            # Process detections
             annotated_frame = frame.copy()
             
-            for det in detections:
-                x1, y1, x2, y2, conf, cls_id = det
+            for x1, y1, x2, y2, conf, cls_id in detections:
                 x1, y1, x2, y2 = map(int, [x1, y1, x2, y2])
                 class_name = self._get_class_name(cls_id)
-                confidence = float(conf)
-
-                if ('glaucoma' in class_name.lower() or 
-                    'optic' in class_name.lower() or 
-                    'disc' in class_name.lower() or 
-                    'cup' in class_name.lower() or
-                    confidence > 0.6):
+                
+                if 'glaucoma' in class_name.lower():
                     result['has_glaucoma'] = True
-                    result['confidence'] = max(result['confidence'], confidence)
+                    result['confidence'] = max(result['confidence'], conf)
 
-                result['detected_features'].append({
-                    'class': class_name,
-                    'confidence': confidence,
-                    'bbox': [x1, y1, x2, y2]
-                })
+                result['detected_features'].append({'class': class_name, 'confidence': conf, 'bbox': [x1, y1, x2, y2]})
 
                 color = self.colors[int(cls_id) % len(self.colors)]
-                label = f"{class_name} ({confidence:.2f})"
+                label = f"{class_name} ({conf:.2f})"
                 cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
-                label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
-                cv2.rectangle(annotated_frame, (x1, y1 - label_size[1] - 10), 
-                              (x1 + label_size[0], y1), color, -1)
-                cv2.putText(annotated_frame, label, (x1, y1 - 5), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                cv2.rectangle(annotated_frame, (x1, y1 - label_size[1] - 10), (x1 + label_size[0], y1), color, -1)
+                cv2.putText(annotated_frame, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
             
             result['annotated_image'] = annotated_frame
-            
         except Exception as e:
-            self.log_to_console(f"Error in glaucoma analysis: {e}")
-        
+            self.log_to_console(f"Error during analysis: {e}")
         return result
 
-    def update_result_display(self, analysis_result):
-        """Update the result display with analysis results"""
-        if analysis_result['has_glaucoma']:
-            result_text = f"GLAUCOMA DETECTED\nConfidence: {analysis_result['confidence']:.2f}\n"
-            result_text += f"Features found: {len(analysis_result['detected_features'])}"
-            self.result_label.config(text=result_text, fg="red")
+    def update_result_display(self, res):
+        if res['has_glaucoma']:
+            text = f"GLAUCOMA DETECTED\nConfidence: {res['confidence']:.2f}"
+            self.result_label.config(text=text, fg="red")
         else:
-            result_text = f"NO GLAUCOMA DETECTED\n"
-            result_text += f"Features analyzed: {len(analysis_result['detected_features'])}"
-            self.result_label.config(text=result_text, fg="green")
+            text = "NO GLAUCOMA DETECTED"
+            self.result_label.config(text=text, fg="green")
 
     def validate_forms(self):
-        """Validate that required form fields are filled"""
-        # Check patient info
         if not self.patient_id_var.get() or not self.patient_name_var.get():
             messagebox.showerror("Error", "Please fill in Patient ID and Name")
             return False
-        
-        # Check doctor info
         if not self.doctor_id_var.get() or not self.doctor_name_var.get():
             messagebox.showerror("Error", "Please fill in Doctor ID and Name")
             return False
-        
         return True
 
     def collect_patient_info(self):
-        """Collect patient information from form"""
-        history = self.patient_history_text.get("1.0", tk.END).strip()
-        return {
-            'patient_id': self.patient_id_var.get(),
-            'name': self.patient_name_var.get(),
-            'age': self.patient_age_var.get(),
-            'gender': self.patient_gender_var.get(),
-            'phone': self.patient_phone_var.get(),
-            'medical_history': history,
-            'examination_date': datetime.now().isoformat()
-        }
+        return {'patient_id': self.patient_id_var.get(), 'name': self.patient_name_var.get(), 'age': self.patient_age_var.get(), 'gender': self.patient_gender_var.get(), 'phone': self.patient_phone_var.get(), 'medical_history': self.patient_history_text.get("1.0", tk.END).strip(), 'examination_date': datetime.now().isoformat()}
 
     def collect_doctor_info(self):
-        """Collect doctor information from form"""
-        return {
-            'doctor_id': self.doctor_id_var.get(),
-            'name': self.doctor_name_var.get(),
-            'specialization': self.doctor_spec_var.get(),
-            'hospital': self.doctor_hospital_var.get()
-        }
+        return {'doctor_id': self.doctor_id_var.get(), 'name': self.doctor_name_var.get(), 'specialization': self.doctor_spec_var.get(), 'hospital': self.doctor_hospital_var.get()}
 
     def send_to_server(self):
-        """Send results to server: upload images, then create record"""
-        if self.detection_result is None:
-            messagebox.showerror("Error", "No analysis results to send")
-            return
+        if self.detection_result is None: messagebox.showerror("Error", "No analysis to send"); return
+        if not self.result_image or not self.original_image_path: messagebox.showerror("Error", "Image paths not found"); return
         
         try:
-            if not self.result_image:
-                messagebox.showerror("Error", "No result image found")
-                return
-
-            if not self.original_image_path and self.imported_image_path:
-                self.original_image_path = self.imported_image_path
-
-            if not self.original_image_path:
-                messagebox.showerror("Error", "No original image available to upload")
-                return
-
-            headers = {}
-            if self.server_cookie:
-                headers['Cookie'] = self.server_cookie
-
+            headers = {'Cookie': self.server_cookie} if self.server_cookie else {}
+            
             self.log_to_console("Uploading original image...")
-            self.log_to_console(f"Upload URL: {self.server_upload_url}")
-            self.log_to_console(f"Original image path: {self.original_image_path}")
-            
             with open(self.original_image_path, 'rb') as f:
-                files = {'image': (os.path.basename(self.original_image_path), f, 'image/jpeg')}
-                r1 = requests.post(self.server_upload_url, files=files, headers=headers, timeout=30)
-            
-            self.log_to_console(f"Upload response status: {r1.status_code}")
-            self.log_to_console(f"Upload response text: {r1.text}")
+                r1 = requests.post(self.server_upload_url, files={'image': f}, headers=headers, timeout=30)
             r1.raise_for_status()
-            
-            response_json = r1.json()
-            original_url = response_json.get('url')
-            if not original_url:
-                raise ValueError(f"No URL in upload response: {response_json}")
-
+            original_url = r1.json().get('url')
+            if not original_url: raise ValueError("No URL in original image upload response")
             self.log_to_console(f"Original image uploaded: {original_url}")
+            
             self.log_to_console("Uploading detected image...")
-            
             with open(self.result_image, 'rb') as f:
-                files = {'image': (os.path.basename(self.result_image), f, 'image/jpeg')}
-                r2 = requests.post(self.server_upload_url, files=files, headers=headers, timeout=30)
-            
-            self.log_to_console(f"Detected upload response status: {r2.status_code}")
+                r2 = requests.post(self.server_upload_url, files={'image': f}, headers=headers, timeout=30)
             r2.raise_for_status()
-            
-            response_json = r2.json()
-            detected_url = response_json.get('url')
-            if not detected_url:
-                raise ValueError(f"No URL in detected upload response: {response_json}")
-            
+            detected_url = r2.json().get('url')
+            if not detected_url: raise ValueError("No URL in detected image upload response")
             self.log_to_console(f"Detected image uploaded: {detected_url}")
 
             patient = self.collect_patient_info()
             doctor = self.collect_doctor_info()
-            try:
-                age_val = int(patient.get('age') or 0)
-            except Exception:
-                age_val = 0
-            gender_val = (patient.get('gender') or '').strip().lower()
-
-            payload = {
-                "patientName": patient.get('name') or "",
-                "age": age_val,
-                "gender": gender_val,
-                "imageDetected": detected_url,
-                "imageOriginal": original_url,
-                "mlHasDisease": bool(self.detection_result.get('has_glaucoma')),
-                "diseaseName": "glaucoma",
-                "createdBy": doctor.get('doctor_id') or ""
-            }
+            payload = {"patientName": patient['name'], "age": int(patient.get('age') or 0), "gender": patient['gender'].lower(), "imageDetected": detected_url, "imageOriginal": original_url, "mlHasDisease": bool(self.detection_result['has_glaucoma']), "diseaseName": "glaucoma", "createdBy": doctor['doctor_id']}
 
             self.log_to_console("Creating record on server...")
             r3 = requests.post(self.server_record_url, json=payload, headers={**headers, 'Content-Type': 'application/json'}, timeout=30)
             r3.raise_for_status()
-
             self.log_to_console("Record created successfully")
             messagebox.showinfo("Success", "Sent to server successfully")
-            
         except Exception as e:
             self.log_to_console(f"Error sending to server: {e}")
             messagebox.showerror("Error", f"Failed to send data: {e}")
 
     def clear_patient_form(self):
-        """Clear patient information form"""
-        self.patient_id_var.set("")
-        self.patient_name_var.set("")
-        self.patient_age_var.set("")
-        self.patient_gender_var.set("")
-        self.patient_phone_var.set("")
-        self.patient_history_text.delete("1.0", tk.END)
+        self.patient_id_var.set(""); self.patient_name_var.set(""); self.patient_age_var.set(""); self.patient_gender_var.set(""); self.patient_phone_var.set(""); self.patient_history_text.delete("1.0", tk.END)
 
     def clear_doctor_form(self):
-        """Clear doctor information form"""
-        self.doctor_id_var.set("")
-        self.doctor_name_var.set("")
-        self.doctor_spec_var.set("")
-        self.doctor_hospital_var.set("")
+        self.doctor_id_var.set(""); self.doctor_name_var.set(""); self.doctor_spec_var.set(""); self.doctor_hospital_var.set("")
 
     def update_frames(self):
-        """Main camera update loop"""
         while self.camera_running:
             try:
-                # Only process camera frames in camera mode
                 if self.detection_mode == "camera":
-                    if self.cap is not None and self.cap.isOpened():
+                    if self.cap and self.cap.isOpened():
                         self.ret, self.frame = self.cap.read()
                     else:
                         self.ret, self.frame = False, None
 
-                    # Create blank frame if no camera
                     if not self.ret or self.frame is None:
                         self.frame = np.zeros((480, 640, 3), dtype=np.uint8)
-                        cv2.putText(self.frame, "No Camera Connected", (180, 240), 
-                                  cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+                        cv2.putText(self.frame, "No Camera Connected", (180, 240), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
 
                     display_frame = self.frame.copy()
-
-                    # Run detection if started and we have a valid frame
                     if self.processing_started and self.ret:
                         self.run_live_detection(display_frame)
 
-                    # Update camera display only in camera mode and when not locked
                     if not self.display_locked:
                         self.update_camera_display(display_frame)
-                
-                # In image mode, don't update the display (keep imported image)
                 time.sleep(0.03)  # ~30 FPS
-                
             except Exception as e:
                 self.log_to_console(f"Error in update_frames: {e}")
 
     def run_live_detection(self, frame):
-        """Run live detection on frame using TensorRT engine"""
         try:
-            # Clear previous detections
-            self.boxes.clear()
-            self.confs.clear()
-            self.clss.clear()
-
-            # Run TRT inference
             start_time = time.time()
             detections = self.detector.infer(frame)
             fps = 1 / (time.time() - start_time)
             self.total_fps.append(fps)
 
-            # Process detections
-            for det in detections:
-                x1, y1, x2, y2, conf, cls_id = det
-                x1, y1, x2, y2 = map(int, [x1, y1, x2, y2])
-                self.confs.append(float(conf))
-                self.clss.append(int(cls_id))
-                self.boxes.append((x1, y1, x2, y2))
+            self.boxes = [(d[0], d[1], d[2], d[3]) for d in detections]
+            self.confs = [d[4] for d in detections]
+            self.clss = [d[5] for d in detections]
 
-            # Draw detections on frame
             for box, cls_id, score in zip(self.boxes, self.clss, self.confs):
-                x1, y1, x2, y2 = box
+                x1, y1, x2, y2 = map(int, box)
                 class_name = self._get_class_name(cls_id)
                 label = f"{class_name} ({score:.2f})"
                 color = self.colors[cls_id % len(self.colors)]
-                
-                # Draw rectangle and label
                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                
-                # Label background
-                label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
-                cv2.rectangle(frame, (x1, y1 - label_size[1] - 10), 
-                            (x1 + label_size[0], y1), color, -1)
-                
-                # Label text
-                cv2.putText(frame, label, (x1, y1 - 5), 
-                          cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                cv2.rectangle(frame, (x1, y1 - label_size[1] - 10), (x1 + label_size[0], y1), color, -1)
+                cv2.putText(frame, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
-            # Display FPS
             if self.total_fps:
-                cv2.putText(frame, f"FPS: {fps:.1f}", (10, 30), 
-                          cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-
+                cv2.putText(frame, f"FPS: {fps:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         except Exception as e:
             self.log_to_console(f"Error in live detection: {e}")
 
     def update_camera_display(self, frame):
-        """Update camera display widget"""
         try:
-            # Convert and resize frame for display
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             frame_resized = cv2.resize(frame_rgb, (500, 375))
-            
-            # Convert to PhotoImage
             img = Image.fromarray(frame_resized)
             imgtk = ImageTk.PhotoImage(image=img)
-            
-            # Update display
             self.camera_frame_widget.config(image=imgtk)
             self.camera_frame_widget.image = imgtk
-            
         except Exception as e:
             self.log_to_console(f"Error updating camera display: {e}")
 
     def log_to_console(self, message):
-        """Add message to console log"""
         timestamp = datetime.now().strftime("%H:%M:%S")
-        formatted_message = f"[{timestamp}] {message}"
-        
+        formatted_message = f"[{timestamp}] {message}\n"
         self.console_log.config(state='normal')
-        self.console_log.insert(tk.END, formatted_message + "\n")
+        self.console_log.insert(tk.END, formatted_message)
         self.console_log.config(state='disabled')
         self.console_log.see(tk.END)
 
-    def __del__(self):
-        """Cleanup when application closes"""
+    def on_closing(self):
+        """Handle window closing event."""
         self.camera_running = False
+        if self.update_frames_thread.is_alive():
+            self.update_frames_thread.join(timeout=1)
         if self.cap is not None:
             self.cap.release()
-
+        self.destroy()
 
 if __name__ == "__main__":
     app = GlaucomaApplicationTRT()
+    app.protocol("WM_DELETE_WINDOW", app.on_closing)
     app.mainloop()
-
-
