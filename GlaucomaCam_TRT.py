@@ -275,6 +275,55 @@ class TRTDetector:
         out = outputs[0]
         if out.ndim == 3:
             out = out[0]
+        # Special case: (6, N) → channels are [x1,y1,x2,y2,cls0,cls1]
+        if out.ndim == 2 and out.shape[0] == 6 and out.shape[1] > 16:
+            pred = out.transpose(1, 0)  # (N, 6)
+            boxes_xyxy = pred[:, 0:4].astype(np.float32)
+            cls2 = pred[:, 4:6].astype(np.float32)
+            # If logits, sigmoid to probs
+            if np.max(cls2) > 1.0:
+                cls2 = 1.0 / (1.0 + np.exp(-cls2))
+            scores = np.max(cls2, axis=1)
+            cls_ids = np.argmax(cls2, axis=1).astype(np.int32)
+
+            # Filter by threshold
+            mask = scores >= self.conf_threshold
+            boxes_xyxy = boxes_xyxy[mask]
+            scores = scores[mask]
+            cls_ids = cls_ids[mask]
+
+            # Normalize handling: if clearly normalized, scale to letterbox
+            if boxes_xyxy.size and np.max(boxes_xyxy) <= 1.5:
+                scale_vec = np.array([W_in, H_in, W_in, H_in], dtype=boxes_xyxy.dtype)
+                boxes_xyxy = boxes_xyxy * scale_vec
+
+            # Map to original or clamp if already in original
+            boxes_mapped = []
+            if boxes_xyxy.size:
+                if np.max(boxes_xyxy) <= max(W_in, H_in) + 1.0:
+                    # Treat as letterboxed coords
+                    for (x1, y1, x2, y2) in boxes_xyxy:
+                        x1, y1, x2, y2 = self._map_to_original(x1, y1, x2, y2, pad_x, pad_y, sx, sy, W0, H0)
+                        boxes_mapped.append([x1, y1, x2, y2])
+                else:
+                    # Already in original image space
+                    for (x1, y1, x2, y2) in boxes_xyxy:
+                        x1 = float(np.clip(x1, 0, W0 - 1))
+                        y1 = float(np.clip(y1, 0, H0 - 1))
+                        x2 = float(np.clip(x2, 0, W0 - 1))
+                        y2 = float(np.clip(y2, 0, H0 - 1))
+                        boxes_mapped.append([x1, y1, x2, y2])
+
+            # NMS
+            keep = self._nms(boxes_mapped, scores.tolist(), self.iou_threshold)
+            dets = []
+            for i in keep:
+                x1, y1, x2, y2 = boxes_mapped[i]
+                if (x2 - x1) < 2 or (y2 - y1) < 2:
+                    continue
+                cls_final = max(0, int(cls_ids[i]) + self.class_offset)
+                dets.append([x1, y1, x2, y2, float(scores[i]), cls_final])
+            return dets
         # Case A: shape (C,N) -> transpose to (N,C)
         if out.ndim == 2 and out.shape[0] in (6, 7, 8) and out.shape[1] > 16:
             out = out.transpose(1, 0)
