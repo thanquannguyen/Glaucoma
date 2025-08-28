@@ -47,8 +47,16 @@ class TensorRTInference:
         # Setup I/O bindings
         for binding in self.engine:
             binding_idx = self.engine.get_binding_index(binding)
-            size = trt.volume(self.engine.get_binding_shape(binding_idx))
+            shape = self.engine.get_binding_shape(binding_idx)
+            size = trt.volume(shape)
             dtype = trt.nptype(self.engine.get_binding_dtype(binding_idx))
+            
+            # Debug: Print binding information
+            print(f"Binding {binding_idx}: {binding}")
+            print(f"  Shape: {shape}")
+            print(f"  Size: {size}")
+            print(f"  Type: {dtype}")
+            print(f"  Is Input: {self.engine.binding_is_input(binding)}")
             
             # Allocate host and device buffers
             host_mem = cuda.pagelocked_empty(size, dtype)
@@ -59,9 +67,9 @@ class TensorRTInference:
             
             # Append to the appropriate list
             if self.engine.binding_is_input(binding):
-                self.inputs.append({'host': host_mem, 'device': device_mem})
+                self.inputs.append({'host': host_mem, 'device': device_mem, 'shape': shape})
             else:
-                self.outputs.append({'host': host_mem, 'device': device_mem})
+                self.outputs.append({'host': host_mem, 'device': device_mem, 'shape': shape})
         
         # Create stream
         self.stream = cuda.Stream()
@@ -83,8 +91,15 @@ class TensorRTInference:
         # Synchronize stream
         self.stream.synchronize()
         
-        # Return output
-        return self.outputs[0]['host']
+        # Return output with proper shape
+        output_data = self.outputs[0]['host']
+        output_shape = self.outputs[0]['shape']
+        
+        # Reshape to proper dimensions if we have shape info
+        if output_shape and len(output_shape) > 1:
+            output_data = output_data.reshape(output_shape)
+        
+        return output_data
 
 
 class GlaucomaApplication(tk.Tk):
@@ -200,48 +215,121 @@ class GlaucomaApplication(tk.Tk):
         """Post-process TensorRT outputs to get bounding boxes"""
         detections = []
         
-        # Reshape output (adjust based on your model's output format)
-        # Typical YOLO output shape: [1, num_detections, 85] where 85 = 4 (bbox) + 1 (conf) + 80 (classes)
-        outputs = outputs.reshape(1, -1, outputs.shape[-1] if len(outputs.shape) > 1 else 85)
+        # Debug: Print output shape to understand the format
+        self.log_to_console(f"TensorRT output shape: {outputs.shape}, size: {outputs.size}")
+        
+        # Additional debug: print some sample values
+        if outputs.size > 0:
+            flat_outputs = outputs.flatten()
+            sample_size = min(20, len(flat_outputs))
+            self.log_to_console(f"First {sample_size} output values: {flat_outputs[:sample_size]}")
+            self.log_to_console(f"Output min: {flat_outputs.min():.6f}, max: {flat_outputs.max():.6f}")
+        
+        # Handle different output formats
+        if len(outputs.shape) == 1:
+            # Flatten output - need to determine the format
+            total_elements = outputs.size
+            
+            # For YOLO models, typical formats:
+            # - 4 classes + 4 bbox + 1 conf = 9 elements per detection
+            # - 1 class + 4 bbox + 1 conf = 6 elements per detection  
+            # - Multiple anchors/scales combined
+            
+            # Try different possible formats (most likely first)
+            possible_formats = [
+                (9, "4 classes + 4 bbox + 1 conf"),  # Your model format (21294/9 = 2366 detections)
+                (6, "1 class + 4 bbox + 1 conf"),
+                (7, "2 classes + 4 bbox + 1 conf"),
+                (8, "3 classes + 4 bbox + 1 conf"),
+                (10, "5 classes + 4 bbox + 1 conf"),
+                (85, "80 classes + 4 bbox + 1 conf")
+            ]
+            
+            for elements_per_detection, description in possible_formats:
+                if total_elements % elements_per_detection == 0:
+                    num_detections = total_elements // elements_per_detection
+                    self.log_to_console(f"Trying format: {description} ({elements_per_detection} elements per detection, {num_detections} detections)")
+                    try:
+                        outputs = outputs.reshape(1, num_detections, elements_per_detection)
+                        break
+                    except:
+                        continue
+            else:
+                # If no standard format fits, try to guess
+                # Assume the most common case: small number of classes
+                num_classes = len(self.class_names)
+                elements_per_detection = 4 + 1 + num_classes  # bbox + conf + classes
+                if total_elements % elements_per_detection == 0:
+                    num_detections = total_elements // elements_per_detection
+                    outputs = outputs.reshape(1, num_detections, elements_per_detection)
+                    self.log_to_console(f"Using custom format: {num_classes} classes + 4 bbox + 1 conf = {elements_per_detection} elements per detection")
+                else:
+                    self.log_to_console(f"Cannot determine output format. Total elements: {total_elements}")
+                    return []
+        else:
+            # Already properly shaped
+            pass
         
         for detection in outputs[0]:
-            # Extract confidence and class scores
-            confidence = detection[4]
+            detection_length = len(detection)
             
-            if confidence > self.conf_threshold:
-                # Extract class scores
-                class_scores = detection[5:]
-                class_id = np.argmax(class_scores)
-                class_confidence = class_scores[class_id]
+            # Handle different detection formats
+            if detection_length >= 5:  # Minimum: 4 bbox + 1 conf
+                # Extract bounding box (first 4 elements)
+                x_center, y_center, width, height = detection[:4]
                 
-                # Final confidence
-                final_conf = confidence * class_confidence
+                # Extract confidence (5th element)
+                confidence = detection[4]
                 
-                if final_conf > self.conf_threshold:
-                    # Extract and scale bounding box
-                    x_center, y_center, width, height = detection[:4]
+                if confidence > self.conf_threshold:
+                    # Extract class information
+                    if detection_length > 5:
+                        # Multiple classes - find the one with highest score
+                        class_scores = detection[5:]
+                        class_id = np.argmax(class_scores)
+                        class_confidence = class_scores[class_id]
+                        final_conf = confidence * class_confidence
+                    else:
+                        # Single class or no class scores
+                        class_id = 0
+                        final_conf = confidence
                     
-                    # Convert from center format to corner format
-                    x1 = int((x_center - width / 2 - dx) / scale)
-                    y1 = int((y_center - height / 2 - dy) / scale)
-                    x2 = int((x_center + width / 2 - dx) / scale)
-                    y2 = int((y_center + height / 2 - dy) / scale)
-                    
-                    # Clip to image bounds
-                    x1 = max(0, min(x1, orig_shape[1]))
-                    y1 = max(0, min(y1, orig_shape[0]))
-                    x2 = max(0, min(x2, orig_shape[1]))
-                    y2 = max(0, min(y2, orig_shape[0]))
-                    
-                    detections.append({
-                        'bbox': [x1, y1, x2, y2],
-                        'confidence': float(final_conf),
-                        'class_id': int(class_id),
-                        'class_name': self.class_names.get(class_id, f'class_{class_id}')
-                    })
+                    if final_conf > self.conf_threshold:
+                        # Scale bounding box coordinates
+                        # YOLO outputs are typically normalized (0-1) or in input image coordinates
+                        
+                        # If coordinates are normalized (0-1), scale to input size
+                        if x_center <= 1.0 and y_center <= 1.0:
+                            x_center *= self.input_size[0]
+                            y_center *= self.input_size[1]
+                            width *= self.input_size[0]
+                            height *= self.input_size[1]
+                        
+                        # Convert from center format to corner format
+                        x1 = int((x_center - width / 2 - dx) / scale)
+                        y1 = int((y_center - height / 2 - dy) / scale)
+                        x2 = int((x_center + width / 2 - dx) / scale)
+                        y2 = int((y_center + height / 2 - dy) / scale)
+                        
+                        # Clip to image bounds
+                        x1 = max(0, min(x1, orig_shape[1]))
+                        y1 = max(0, min(y1, orig_shape[0]))
+                        x2 = max(0, min(x2, orig_shape[1]))
+                        y2 = max(0, min(y2, orig_shape[0]))
+                        
+                        # Only add if the box is valid
+                        if x2 > x1 and y2 > y1:
+                            detections.append({
+                                'bbox': [x1, y1, x2, y2],
+                                'confidence': float(final_conf),
+                                'class_id': int(class_id),
+                                'class_name': self.class_names.get(class_id, f'class_{class_id}')
+                            })
         
         # Apply NMS
+        self.log_to_console(f"Found {len(detections)} detections before NMS")
         detections = self.apply_nms(detections)
+        self.log_to_console(f"Found {len(detections)} detections after NMS")
         
         return detections
 
