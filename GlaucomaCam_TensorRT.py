@@ -227,17 +227,17 @@ class GlaucomaApplication(tk.Tk):
     def postprocess_detections(self, outputs, scale, dx, dy, orig_shape):
         """Post-process TensorRT outputs to get bounding boxes"""
         detections = []
-        
+
         # Debug: Print output info (only first time)
         if not hasattr(self, '_output_shape_logged'):
             if isinstance(outputs, dict):
-                self.log_to_console(f"TensorRT outputs (EfficientNMS): {list(outputs.keys())}")
+                self.log_to_console(f"TensorRT outputs: {list(outputs.keys())}")
                 for name, arr in outputs.items():
                     self.log_to_console(f"  {name}: shape={arr.shape}, dtype={arr.dtype}")
             else:
                 self.log_to_console(f"TensorRT output shape: {outputs.shape}, size: {outputs.size}")
             self._output_shape_logged = True
-        
+
         # Handle EfficientNMS (4 outputs: num_dets, boxes, scores, classes)
         if isinstance(outputs, dict):
             # Try common names first
@@ -258,7 +258,7 @@ class GlaucomaApplication(tk.Tk):
                 try:
                     n = int(num_dets[0]) if num_dets is not None else min(100, boxes.shape[1])
                     self.log_to_console(f"EfficientNMS: Processing {n} detections from NMS")
-                    
+
                     # Extract valid detections
                     boxes_slice = boxes[0, :n]     # (n, 4) xyxy on input scale
                     scores_slice = scores[0, :n]   # (n,) confidence scores
@@ -266,15 +266,15 @@ class GlaucomaApplication(tk.Tk):
 
                     oh, ow = orig_shape[:2]
                     valid_count = 0
-                    
+
                     for i in range(n):
                         conf = float(scores_slice[i])
                         if conf < self.conf_threshold:
                             continue
-                            
+
                         x1, y1, x2, y2 = boxes_slice[i]
                         cid = int(classes_slice[i])
-                        
+
                         # Undo letterbox: subtract padding, then divide by scale
                         x1 = int((x1 - dx) / scale)
                         y1 = int((y1 - dy) / scale)
@@ -286,7 +286,7 @@ class GlaucomaApplication(tk.Tk):
                         y1 = max(0, min(y1, oh))
                         x2 = max(0, min(x2, ow))
                         y2 = max(0, min(y2, oh))
-                        
+
                         if x2 > x1 and y2 > y1:
                             detections.append({
                                 "bbox": [x1, y1, x2, y2],
@@ -295,10 +295,10 @@ class GlaucomaApplication(tk.Tk):
                                 "class_name": self.class_names.get(cid, f"class_{cid}")
                             })
                             valid_count += 1
-                    
+
                     self.log_to_console(f"Found {valid_count} valid detections after EfficientNMS processing")
                     return detections  # Return directly, NMS already done
-                    
+
                 except Exception as e:
                     self.log_to_console(f"Error processing EfficientNMS outputs: {e}")
                     # Fall through to legacy processing
@@ -310,14 +310,126 @@ class GlaucomaApplication(tk.Tk):
                     self.log_to_console(f"Using fallback output: {keys[0]} with shape {outputs.shape}")
                 else:
                     return []
-        
-        # Fallback: Handle legacy single-tensor output (if EfficientNMS failed)
+
+        # Handle single-tensor output format (YOLO-style output)
         if not isinstance(outputs, dict):
-            self.log_to_console("Processing legacy/raw output format")
-            # The rest of your existing processing code can go here if needed
-            # For now, return empty since we expect EfficientNMS format
-            self.log_to_console("Legacy format not implemented - expected EfficientNMS")
-            
+            try:
+                self.log_to_console(f"Processing single tensor output with shape: {outputs.shape}")
+
+                # YOLO output format: [batch, anchors, (classes + 5)]
+                # Where 5 = x, y, w, h, confidence
+                batch_size, num_anchors, num_features = outputs.shape
+
+                # Get number of classes from the model
+                num_classes = len(self.class_names) if hasattr(self, 'class_names') else 4
+                expected_features = num_classes + 5  # 4 classes + 5 bbox/conf features
+
+                self.log_to_console(f"Expected features: {expected_features}, Actual features: {num_features}")
+
+                # Debug: Print some sample values to understand the output format
+                if not hasattr(self, '_tensor_debugged'):
+                    self.log_to_console("Sample output values (first anchor):")
+                    sample = outputs[0, 0, :min(10, num_features)]
+                    self.log_to_console(f"First 10 features: {sample}")
+                    self._tensor_debugged = True
+
+                # Handle different possible output formats
+                if num_features == expected_features:
+                    # Standard YOLO format
+                    boxes_xywh = outputs[0, :, :4]  # x, y, w, h (center format)
+                    obj_conf = outputs[0, :, 4:5]  # object confidence
+                    class_probs = outputs[0, :, 5:5+num_classes]  # class probabilities
+                elif num_features == 5 + 80:  # COCO format
+                    # If it's COCO format, we need to handle class mapping
+                    self.log_to_console("Detected COCO format output, mapping to glaucoma classes")
+                    boxes_xywh = outputs[0, :, :4]
+                    obj_conf = outputs[0, :, 4:5]
+                    # For glaucoma, we'll use specific COCO classes or default to first class
+                    class_probs = outputs[0, :, 5:5+num_classes]  # Take first N classes
+                else:
+                    # Unknown format - try to infer
+                    self.log_to_console(f"Unknown output format with {num_features} features")
+                    if num_features >= 5:
+                        boxes_xywh = outputs[0, :, :4]
+                        obj_conf = outputs[0, :, 4:5]
+                        class_probs = outputs[0, :, 5:min(5+num_classes, num_features)]
+                        if 5+num_classes > num_features:
+                            # Pad with zeros if needed
+                            padding = np.zeros((num_anchors, 5+num_classes - num_features))
+                            class_probs = np.concatenate([class_probs, padding], axis=1)
+                    else:
+                        self.log_to_console("Output format too small to parse")
+                        return []
+
+                oh, ow = orig_shape[:2]
+                valid_count = 0
+
+                for i in range(min(num_anchors, 1000)):  # Limit to prevent too many iterations
+                    # Get the best class and its confidence
+                    class_confidences = class_probs[i] * obj_conf[i, 0]
+                    best_class_id = int(np.argmax(class_confidences))
+                    best_conf = float(class_confidences[best_class_id])
+
+                    if best_conf < self.conf_threshold:
+                        continue
+
+                    # Extract box coordinates (center format -> corner format)
+                    x_center, y_center, width, height = boxes_xywh[i]
+
+                    # Convert to float to avoid issues
+                    x_center = float(x_center)
+                    y_center = float(y_center)
+                    width = float(width)
+                    height = float(height)
+
+                    # YOLO coordinates are typically normalized to [0, 1] relative to input size
+                    # Scale to input size first
+                    x_center *= self.input_size[0]
+                    y_center *= self.input_size[1] if len(self.input_size) > 1 else self.input_size[0]
+                    width *= self.input_size[0]
+                    height *= self.input_size[1] if len(self.input_size) > 1 else self.input_size[0]
+
+                    # Convert center format to corner format
+                    x1 = x_center - width / 2
+                    y1 = y_center - height / 2
+                    x2 = x_center + width / 2
+                    y2 = y_center + height / 2
+
+                    # Undo letterbox: subtract padding, then divide by scale
+                    x1 = (x1 - dx) / scale
+                    y1 = (y1 - dy) / scale
+                    x2 = (x2 - dx) / scale
+                    y2 = (y2 - dy) / scale
+
+                    # Convert to integers and clip to image bounds
+                    x1 = max(0, min(int(x1), ow))
+                    y1 = max(0, min(int(y1), oh))
+                    x2 = max(0, min(int(x2), ow))
+                    y2 = max(0, min(int(y2), oh))
+
+                    if x2 > x1 and y2 > y1:
+                        detections.append({
+                            "bbox": [x1, y1, x2, y2],
+                            "confidence": best_conf,
+                            "class_id": best_class_id,
+                            "class_name": self.class_names.get(best_class_id, f"class_{best_class_id}")
+                        })
+                        valid_count += 1
+
+                self.log_to_console(f"Found {valid_count} valid detections from single tensor processing")
+
+                # Apply NMS since the model doesn't have built-in NMS
+                if detections:
+                    detections = self.apply_nms(detections)
+                    self.log_to_console(f"After NMS: {len(detections)} detections")
+
+                return detections
+
+            except Exception as e:
+                self.log_to_console(f"Error processing single tensor output: {e}")
+                import traceback
+                self.log_to_console(f"Traceback: {traceback.format_exc()}")
+
         return detections
 
     def apply_nms(self, detections):
