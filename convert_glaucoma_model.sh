@@ -15,7 +15,7 @@ ENGINE_OUTPUT="best.engine"
 PRECISION="fp16"  # Use FP16 for better performance on Jetson Nano
 BATCH_SIZE=1
 WORKSPACE_MB=512  # Reduced for Jetson Nano memory constraints
-INPUT_SHAPE="1 3 640 640"  # Standard YOLO input shape
+INPUT_SHAPE="1 3 416 416"  # Glaucoma model input shape
 
 # Check if model exists
 if [ ! -f "$ONNX_MODEL" ]; then
