@@ -28,6 +28,10 @@ class GlaucomaApplication(tk.Tk):
         self.doctor_info = {}
         self.detection_result = None
         self.result_image = None
+        self.original_image_path = None
+        self.server_upload_url = os.environ.get("GL_UPLOAD_URL", "http://100.104.212.73:8002/uploads")
+        self.server_record_url = os.environ.get("GL_RECORD_URL", "http://100.104.212.73:8002/record/create")
+        self.server_cookie = os.environ.get("GL_SERVER_COOKIE", "")
         
         # Mode control: 'camera' or 'image'
         self.detection_mode = 'camera'
@@ -497,13 +501,20 @@ class GlaucomaApplication(tk.Tk):
         # Process the image
         analysis_result = self.analyze_for_glaucoma(analysis_image)
         
-        # Save the result image
+        # Save the result image and the original image
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         result_filename = f"glaucoma_result_{timestamp}.jpg"
         result_path = os.path.join("results", result_filename)
         os.makedirs("results", exist_ok=True)
         
         cv2.imwrite(result_path, analysis_result['annotated_image'])
+        original_filename = f"glaucoma_original_{timestamp}.jpg"
+        original_path = os.path.join("results", original_filename)
+        try:
+            cv2.imwrite(original_path, analysis_image)
+            self.original_image_path = original_path
+        except Exception:
+            self.original_image_path = self.imported_image_path if self.detection_mode == "image" else None
         
         # Update results
         self.detection_result = analysis_result
@@ -659,43 +670,86 @@ class GlaucomaApplication(tk.Tk):
         }
 
     def send_to_server(self):
-        """Send results to server (placeholder implementation)"""
+        """Send results to server: upload images, then create record"""
         if self.detection_result is None:
             messagebox.showerror("Error", "No analysis results to send")
             return
         
         try:
-            # Prepare data package
-            data_package = {
-                'patient_info': self.collect_patient_info(),
-                'doctor_info': self.collect_doctor_info(),
-                'detection_result': {
-                    'has_glaucoma': self.detection_result['has_glaucoma'],
-                    'confidence': self.detection_result['confidence'],
-                    'detected_features': self.detection_result['detected_features'],
-                    'analysis_timestamp': datetime.now().isoformat()
-                },
-                'image_path': self.result_image
+            if not self.result_image:
+                messagebox.showerror("Error", "No result image found")
+                return
+
+            if not self.original_image_path and self.imported_image_path:
+                self.original_image_path = self.imported_image_path
+
+            if not self.original_image_path:
+                messagebox.showerror("Error", "No original image available to upload")
+                return
+
+            headers = {}
+            if self.server_cookie:
+                headers['Cookie'] = self.server_cookie
+
+            self.log_to_console("Uploading original image...")
+            self.log_to_console(f"Upload URL: {self.server_upload_url}")
+            self.log_to_console(f"Original image path: {self.original_image_path}")
+            
+            with open(self.original_image_path, 'rb') as f:
+                files = {'image': (os.path.basename(self.original_image_path), f, 'image/jpeg')}
+                r1 = requests.post(self.server_upload_url, files=files, headers=headers, timeout=30)
+            
+            self.log_to_console(f"Upload response status: {r1.status_code}")
+            self.log_to_console(f"Upload response text: {r1.text}")
+            r1.raise_for_status()
+            
+            response_json = r1.json()
+            original_url = response_json.get('url')
+            if not original_url:
+                raise ValueError(f"No URL in upload response: {response_json}")
+
+            self.log_to_console(f"Original image uploaded: {original_url}")
+            self.log_to_console("Uploading detected image...")
+            
+            with open(self.result_image, 'rb') as f:
+                files = {'image': (os.path.basename(self.result_image), f, 'image/jpeg')}
+                r2 = requests.post(self.server_upload_url, files=files, headers=headers, timeout=30)
+            
+            self.log_to_console(f"Detected upload response status: {r2.status_code}")
+            r2.raise_for_status()
+            
+            response_json = r2.json()
+            detected_url = response_json.get('url')
+            if not detected_url:
+                raise ValueError(f"No URL in detected upload response: {response_json}")
+            
+            self.log_to_console(f"Detected image uploaded: {detected_url}")
+
+            patient = self.collect_patient_info()
+            doctor = self.collect_doctor_info()
+            try:
+                age_val = int(patient.get('age') or 0)
+            except Exception:
+                age_val = 0
+            gender_val = (patient.get('gender') or '').strip().lower()
+
+            payload = {
+                "patientName": patient.get('name') or "",
+                "age": age_val,
+                "gender": gender_val,
+                "imageDetected": detected_url,
+                "imageOriginal": original_url,
+                "mlHasDisease": bool(self.detection_result.get('has_glaucoma')),
+                "diseaseName": "glaucoma",
+                "createdBy": doctor.get('doctor_id') or ""
             }
-            
-            # Placeholder for server communication
-            # In real implementation, you would send this to your server
-            self.log_to_console("Sending data to server...")
-            
-            # For now, just save to JSON file
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            json_filename = f"glaucoma_report_{timestamp}.json"
-            json_path = os.path.join("results", json_filename)
-            
-            with open(json_path, 'w') as f:
-                json.dump(data_package, f, indent=2)
-            
-            self.log_to_console(f"Data package saved: {json_path}")
-            messagebox.showinfo("Success", f"Report saved successfully!\nFile: {json_filename}")
-            
-            # TODO: Implement actual server communication
-            # response = requests.post('http://your-server.com/api/glaucoma-results', 
-            #                         json=data_package)
+
+            self.log_to_console("Creating record on server...")
+            r3 = requests.post(self.server_record_url, json=payload, headers={**headers, 'Content-Type': 'application/json'}, timeout=30)
+            r3.raise_for_status()
+
+            self.log_to_console("Record created successfully")
+            messagebox.showinfo("Success", "Sent to server successfully")
             
         except Exception as e:
             self.log_to_console(f"Error sending to server: {e}")
