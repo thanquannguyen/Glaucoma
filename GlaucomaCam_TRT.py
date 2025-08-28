@@ -271,10 +271,15 @@ class TRTDetector:
             dets = self._apply_classwise_nms(dets, self.iou_threshold)
             return dets
 
-        # Generic Ultralytics-like output: (1, N, M) with [x,y,w,h,conf,cls...]
+        # Generic output cases
         out = outputs[0]
         if out.ndim == 3:
             out = out[0]
+        # Case A: shape (C,N) -> transpose to (N,C)
+        if out.ndim == 2 and out.shape[0] in (6, 7, 8) and out.shape[1] > 16:
+            out = out.transpose(1, 0)
+
+        # Case B: last-dim layout (N,M)
         if out.shape[-1] >= 6:
             boxes_xywh = out[:, :4]
             obj_conf = out[:, 4]
@@ -284,14 +289,30 @@ class TRTDetector:
                 cls_conf = cls_scores[np.arange(cls_scores.shape[0]), cls_ids]
                 scores = obj_conf * cls_conf
             else:
-                cls_ids = np.zeros_like(obj_conf, dtype=np.int32)
+                # Exactly 6 outputs per candidate: [cx,cy,w,h,conf,clsId] or [x1,y1,x2,y2,conf,clsId]
                 scores = obj_conf
+                cls_ids = out[:, 5].astype(np.int32)
 
             # Filter by conf
             mask = scores >= self.conf_threshold
             boxes_xywh = boxes_xywh[mask]
             scores = scores[mask]
             cls_ids = cls_ids[mask]
+
+            # Scale normalized if needed
+            is_norm = None
+            if self.force_normalized in ("1", "true", "yes"):
+                is_norm = True
+            elif self.force_normalized in ("0", "false", "no"):
+                is_norm = False
+            if boxes_xywh.size and (is_norm is True or (is_norm is None and np.max(boxes_xywh) <= 1.5)):
+                if self.force_format == 'xyxy':
+                    scale_vec = np.array([W_in, H_in, W_in, H_in], dtype=boxes_xywh.dtype)
+                    boxes_xywh = boxes_xywh * scale_vec
+                else:
+                    # cx,cy,w,h normalized
+                    scale_vec = np.array([W_in, H_in, W_in, H_in], dtype=boxes_xywh.dtype)
+                    boxes_xywh = boxes_xywh * scale_vec
 
             # Convert to xyxy in letterboxed space
             if self.force_format == 'xyxy':
