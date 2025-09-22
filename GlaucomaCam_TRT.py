@@ -617,37 +617,86 @@ class GlaucomaApplicationTRT(tk.Tk):
         return {'doctor_id': self.doctor_id_var.get(), 'name': self.doctor_name_var.get(), 'specialization': self.doctor_spec_var.get(), 'hospital': self.doctor_hospital_var.get()}
 
     def send_to_server(self):
-        if self.detection_result is None: messagebox.showerror("Error", "No analysis to send"); return
-        if not self.result_image or not self.original_image_path: messagebox.showerror("Error", "Image paths not found"); return
+        if self.detection_result is None:
+            messagebox.showerror("Error", "No analysis results to send")
+            return
         
         try:
-            headers = {'Cookie': self.server_cookie} if self.server_cookie else {}
-            
+            if not self.result_image:
+                messagebox.showerror("Error", "No result image found")
+                return
+
+            if not self.original_image_path and self.imported_image_path:
+                self.original_image_path = self.imported_image_path
+
+            if not self.original_image_path:
+                messagebox.showerror("Error", "No original image available to upload")
+                return
+
+            headers = {}
+            if self.server_cookie:
+                headers['Cookie'] = self.server_cookie
+
             self.log_to_console("Uploading original image...")
-            with open(self.original_image_path, 'rb') as f:
-                r1 = requests.post(self.server_upload_url, files={'image': f}, headers=headers, timeout=30)
-            r1.raise_for_status()
-            original_url = r1.json().get('url')
-            if not original_url: raise ValueError("No URL in original image upload response")
-            self.log_to_console(f"Original image uploaded: {original_url}")
+            self.log_to_console(f"Upload URL: {self.server_upload_url}")
+            self.log_to_console(f"Original image path: {self.original_image_path}")
             
+            with open(self.original_image_path, 'rb') as f:
+                files = {'image': (os.path.basename(self.original_image_path), f, 'image/jpeg')}
+                r1 = requests.post(self.server_upload_url, files=files, headers=headers, timeout=30)
+            
+            self.log_to_console(f"Upload response status: {r1.status_code}")
+            self.log_to_console(f"Upload response text: {r1.text}")
+            r1.raise_for_status()
+            
+            response_json = r1.json()
+            original_url = response_json.get('url')
+            if not original_url:
+                raise ValueError(f"No URL in upload response: {response_json}")
+
+            self.log_to_console(f"Original image uploaded: {original_url}")
             self.log_to_console("Uploading detected image...")
+            
             with open(self.result_image, 'rb') as f:
-                r2 = requests.post(self.server_upload_url, files={'image': f}, headers=headers, timeout=30)
+                files = {'image': (os.path.basename(self.result_image), f, 'image/jpeg')}
+                r2 = requests.post(self.server_upload_url, files=files, headers=headers, timeout=30)
+            
+            self.log_to_console(f"Detected upload response status: {r2.status_code}")
             r2.raise_for_status()
-            detected_url = r2.json().get('url')
-            if not detected_url: raise ValueError("No URL in detected image upload response")
+            
+            response_json = r2.json()
+            detected_url = response_json.get('url')
+            if not detected_url:
+                raise ValueError(f"No URL in detected upload response: {response_json}")
+            
             self.log_to_console(f"Detected image uploaded: {detected_url}")
 
             patient = self.collect_patient_info()
             doctor = self.collect_doctor_info()
-            payload = {"patientName": patient['name'], "age": int(patient.get('age') or 0), "gender": patient['gender'].lower(), "imageDetected": detected_url, "imageOriginal": original_url, "mlHasDisease": bool(self.detection_result['has_glaucoma']), "diseaseName": "glaucoma", "createdBy": doctor['doctor_id']}
+            try:
+                age_val = int(patient.get('age') or 0)
+            except Exception:
+                age_val = 0
+            gender_val = (patient.get('gender') or '').strip().lower()
+
+            payload = {
+                "patientName": patient.get('name') or "",
+                "age": age_val,
+                "gender": gender_val,
+                "imageDetected": detected_url,
+                "imageOriginal": original_url,
+                "mlHasDisease": bool(self.detection_result.get('has_glaucoma')),
+                "diseaseName": "glaucoma",
+                "createdBy": doctor.get('doctor_id') or ""
+            }
 
             self.log_to_console("Creating record on server...")
             r3 = requests.post(self.server_record_url, json=payload, headers={**headers, 'Content-Type': 'application/json'}, timeout=30)
             r3.raise_for_status()
+
             self.log_to_console("Record created successfully")
             messagebox.showinfo("Success", "Sent to server successfully")
+            
         except Exception as e:
             self.log_to_console(f"Error sending to server: {e}")
             messagebox.showerror("Error", f"Failed to send data: {e}")
